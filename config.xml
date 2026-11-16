@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <broker>
+    <name>Medha Server</name>
+    <host>iot.medha-res.com</host>
+    <port>8883</port>
+    <protocol>mqtts</protocol>
+    <client_id>f915acbe-0d4e-4de2-9204-134295a904bc</client_id>
+    <append_timestamp>true</append_timestamp>
+    <username>InternalUser</username>
+    <password></password>
+    <keepalive>10</keepalive>
+    <clean_session>true</clean_session>
+    <use_tls>true</use_tls>
+  </broker>
+
+  <topics>
+    <ondemand_sub_template>rtsg-1/ongridrooftop/{imei}/ondemand/sub</ondemand_sub_template>
+    <config_sub_template>rtsg-1/ongridrooftop/{imei}/config/sub</config_sub_template>
+    <messagekey_sub_template>rtsg-1/ongridrooftop/{imei}/messagekey/sub</messagekey_sub_template>
+    <info_sub_template>rtsg-1/ongridrooftop/{imei}/info/sub</info_sub_template>
+    
+    <data_pub_template>rtsg-1/ongridrooftop/{imei}/data/pub</data_pub_template>
+    <heartbeat_pub_template>rtsg-1/ongridrooftop/{imei}/heartbeat/pub</heartbeat_pub_template>
+    <ondemand_pub_template>rtsg-1/ongridrooftop/{imei}/ondemand/pub</ondemand_pub_template>
+    <config_pub_template>rtsg-1/ongridrooftop/{imei}/config/pub</config_pub_template>
+    <rtevent_pub_template>rtsg-1/ongridrooftop/{imei}/rtevent/pub</rtevent_pub_template>
+
+    <info_subscriptions>
+      <topic>rtsg-1/ongridrooftop/866738083623411/data/pub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/heartbeat/pub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/ondemand/pub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/config/pub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/ondemand/sub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/config/sub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/messagekey/sub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/info/sub</topic>
+      <topic>rtsg-1/ongridrooftop/866738083623411/rtevent/pub</topic>
+      <topic>rtsg-1/ongridrooftop/+/data/pub</topic>
+      <topic>rtsg-1/ongridrooftop/+/heartbeat/pub</topic>
+      <topic>rtsg-1/ongridrooftop/+/ondemand/pub</topic>
+      <topic>rtsg-1/ongridrooftop/+/config/pub</topic>
+      <topic>rtsg-1/ongridrooftop/+/rtevent/pub</topic>
+    </info_subscriptions>
+  </topics>
+
+  <settings>
+    <auto_poll>true</auto_poll>
+    <poll_interval_seconds>15</poll_interval_seconds>
+    <response_timeout_seconds>10</response_timeout_seconds>
+    <payload_to_send>asas</payload_to_send>
+  </settings>
+
+  <registered_devices>
+    <device>
+      <imei>866738083623411</imei>
+      <name>Medha Ongrid Rooftop Solar Unit 1</name>
+      <device_type>ONGRID_ROOFTOP_SOLAR</device_type>
+      <location>RTSG Site 1</location>
+      <enabled>true</enabled>
+    </device>
+  </registered_devices>
+</configuration>
