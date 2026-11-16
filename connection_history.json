@@ -1,25 +1,27 @@
 [
   {
     "connection_num": 1,
-    "name": "Medha Server Default",
-    "host": "iot.medha-res.com",
+    "name": "RMS IoT SCADA (866738083619898)",
+    "host": "rms.iotscada-pmsg.com",
     "port": 8883,
     "use_tls": true,
-    "username": "InternalUser",
-    "imei": "866738083623411",
-    "timestamp": "2026-11-16 15:30:00 UTC",
+    "username": "test",
+    "imei": "866738083619898",
+    "timestamp": "2026-11-16 16:20:00 UTC",
     "config": {
       "broker": {
-        "name": "Medha Server",
-        "host": "iot.medha-res.com",
+        "name": "866738083619898",
+        "host": "rms.iotscada-pmsg.com",
         "port": 8883,
         "protocol": "mqtts",
-        "client_id": "f915acbe-0d4e-4de2-9204-134295a904bc",
-        "append_timestamp": true,
-        "username": "InternalUser",
+        "mqtt_version": "3.1.1",
+        "client_id": "84e738ec-179a-4546-88af-cc3ba679d08d",
+        "append_timestamp": false,
+        "clean_session": false,
+        "username": "test",
         "password": "",
         "keepalive": 10,
-        "clean_session": true,
+        "connect_timeout": 30,
         "use_tls": true
       },
       "topics": {
@@ -33,15 +35,15 @@
         "config_pub_template": "rtsg-1/ongridrooftop/{imei}/config/pub",
         "rtevent_pub_template": "rtsg-1/ongridrooftop/{imei}/rtevent/pub",
         "info_subscriptions": [
-          "rtsg-1/ongridrooftop/866738083623411/data/pub",
-          "rtsg-1/ongridrooftop/866738083623411/heartbeat/pub",
-          "rtsg-1/ongridrooftop/866738083623411/ondemand/pub",
-          "rtsg-1/ongridrooftop/866738083623411/config/pub",
-          "rtsg-1/ongridrooftop/866738083623411/ondemand/sub",
-          "rtsg-1/ongridrooftop/866738083623411/config/sub",
-          "rtsg-1/ongridrooftop/866738083623411/messagekey/sub",
-          "rtsg-1/ongridrooftop/866738083623411/info/sub",
-          "rtsg-1/ongridrooftop/866738083623411/rtevent/pub",
+          "rtsg-1/ongridrooftop/866738083619898/data/pub",
+          "rtsg-1/ongridrooftop/866738083619898/heartbeat/pub",
+          "rtsg-1/ongridrooftop/866738083619898/ondemand/pub",
+          "rtsg-1/ongridrooftop/866738083619898/config/pub",
+          "rtsg-1/ongridrooftop/866738083619898/ondemand/sub",
+          "rtsg-1/ongridrooftop/866738083619898/config/sub",
+          "rtsg-1/ongridrooftop/866738083619898/messagekey/sub",
+          "rtsg-1/ongridrooftop/866738083619898/info/sub",
+          "rtsg-1/ongridrooftop/866738083619898/rtevent/pub",
           "rtsg-1/ongridrooftop/+/data/pub",
           "rtsg-1/ongridrooftop/+/heartbeat/pub",
           "rtsg-1/ongridrooftop/+/ondemand/pub",
@@ -52,82 +54,15 @@
       "settings": {
         "auto_poll": true,
         "poll_interval_seconds": 15,
-        "response_timeout_seconds": 10,
+        "response_timeout_seconds": 30,
         "payload_to_send": "asas"
       },
       "registered_devices": [
         {
-          "imei": "866738083623411",
-          "name": "Medha Ongrid Rooftop Solar Unit 1",
+          "imei": "866738083619898",
+          "name": "Rooftop Solar Unit 866738083619898",
           "device_type": "ONGRID_ROOFTOP_SOLAR",
-          "location": "RTSG Site 1",
-          "enabled": true
-        }
-      ]
-    }
-  },
-  {
-    "connection_num": 2,
-    "name": "Medha Server - IMEI 866738083623411",
-    "host": "iot.medha-res.com",
-    "port": 8883,
-    "use_tls": true,
-    "username": "InternalUser",
-    "imei": "866738083623411",
-    "timestamp": "2026-11-16 10:39:59 UTC",
-    "config": {
-      "broker": {
-        "name": "Medha Server",
-        "host": "iot.medha-res.com",
-        "port": 8883,
-        "protocol": "mqtts",
-        "client_id": "f915acbe-0d4e-4de2-9204-134295a904bc",
-        "append_timestamp": true,
-        "username": "InternalUser",
-        "password": "",
-        "keepalive": 10,
-        "clean_session": true,
-        "use_tls": true
-      },
-      "topics": {
-        "ondemand_sub_template": "rtsg-1/ongridrooftop/866738083623411/ondemand/sub",
-        "config_sub_template": "rtsg-1/ongridrooftop/866738083623411/config/sub",
-        "messagekey_sub_template": "rtsg-1/ongridrooftop/866738083623411/messagekey/sub",
-        "info_sub_template": "rtsg-1/ongridrooftop/866738083623411/info/sub",
-        "data_pub_template": "rtsg-1/ongridrooftop/866738083623411/data/pub",
-        "heartbeat_pub_template": "rtsg-1/ongridrooftop/866738083623411/heartbeat/pub",
-        "ondemand_pub_template": "rtsg-1/ongridrooftop/866738083623411/ondemand/pub",
-        "config_pub_template": "rtsg-1/ongridrooftop/866738083623411/config/pub",
-        "rtevent_pub_template": "rtsg-1/ongridrooftop/866738083623411/rtevent/pub",
-        "info_subscriptions": [
-          "rtsg-1/ongridrooftop/866738083623411/data/pub",
-          "rtsg-1/ongridrooftop/866738083623411/heartbeat/pub",
-          "rtsg-1/ongridrooftop/866738083623411/ondemand/pub",
-          "rtsg-1/ongridrooftop/866738083623411/config/pub",
-          "rtsg-1/ongridrooftop/866738083623411/ondemand/sub",
-          "rtsg-1/ongridrooftop/866738083623411/config/sub",
-          "rtsg-1/ongridrooftop/866738083623411/messagekey/sub",
-          "rtsg-1/ongridrooftop/866738083623411/info/sub",
-          "rtsg-1/ongridrooftop/866738083623411/rtevent/pub",
-          "rtsg-1/ongridrooftop/+/data/pub",
-          "rtsg-1/ongridrooftop/+/heartbeat/pub",
-          "rtsg-1/ongridrooftop/+/ondemand/pub",
-          "rtsg-1/ongridrooftop/+/config/pub",
-          "rtsg-1/ongridrooftop/+/rtevent/pub"
-        ]
-      },
-      "settings": {
-        "auto_poll": true,
-        "poll_interval_seconds": 15,
-        "response_timeout_seconds": 10,
-        "payload_to_send": "asas"
-      },
-      "registered_devices": [
-        {
-          "imei": "866738083623411",
-          "name": "Rajasthan_Testing",
-          "device_type": "ONGRID_ROOFTOP_SOLAR",
-          "location": "Site Custom",
+          "location": "Site Main",
           "enabled": true
         }
       ]

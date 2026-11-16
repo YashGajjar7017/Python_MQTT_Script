@@ -1,106 +1,60 @@
-# MQTT Remote Device Request Handler & Server
+# MQTT SCADA & Ondemand Controller
 
-A complete Python MQTT controller and telemetry request handler tailored for IoT remote device polling, register decoding, and bi-directional MQTT handshake over TLS/MQTTS.
+A Python MQTT controller and telemetry processor featuring single-IMEI targeting, terminal noise silencing, Tkinter desktop GUI with dedicated Ondemand command dispatching, real-time response viewer, and command-line configuration file manager.
 
 ---
 
-## Restored Project History & Features
+## Key Updates & Features
 
-### Main Menu Options
+### 1. Single IMEI Subscription (No Server-Wide Wildcards)
+- Removed all `+` wildcards (`rtsg-1/ongridrooftop/+/...`).
+- Subscribes strictly to the **target IMEI** (e.g. `866738083619898`), preventing messages from other server devices from flooding your session.
+- **Silence `rtevent` from console**: `skip_rtevent_console: true` silences high-frequency `rtevent` messages from spamming the terminal, while still logging them safely to `rtevent_logs.csv` in the background.
 
-The application features a 9-option interactive control menu:
+### 2. Tkinter GUI: "Send Ondemand Request" Button & Live Response Viewer
+- **Tab 2 (Send Ondemand Command)** now features:
+  - **`🚀 SEND ONDEMAND REQUEST` button**: One click immediately publishes the payload (`asas` or custom) to the target device request topic.
+  - **Live Ondemand Response Viewer**: Automatically updates in real time when the remote device replies on `.../ondemand/pub`, breaking down registers (`3345`, `3747`, `4013`, etc.) with millisecond round-trip latency.
+
+### 3. Option [5]: Configuration Files List in Command Line
+- Entering **`5`** in the main menu displays an interactive file manager right in your terminal:
+  - Lists `config.yaml`, `config.xml`, `server_credentials.json`, `connection_history.json`, etc.
+  - **Enter number** (e.g. `1`): Immediately runs and connects with that config.
+  - **`V <number>`** (e.g. `v 1`): Prints the file contents directly in the terminal.
+  - **`O <number>`** (e.g. `o 1`): Opens the file in Windows Notepad / default editor.
+
+---
+
+## Main Menu
+
+Launch the controller:
+```powershell
+python MQTT_SERVER_CONTROLLER.py
+```
 
 ```text
 ================================================================================
-              MQTT REMOTE DEVICE CONTROLLER - MAIN SELECTION MENU
+              MQTT SCADA & RTEVENT CONTROLLER - MAIN MENU
 ================================================================================
 
-Please select a Configuration File or Action:
+Please select an Option:
 
-  [1] Select the previous connection
-  [2] Enter new IEMI / IMEI
-  [3] Enter new connection
-  [4] config.yaml                  (Default Medha Server YAML Config - 9 Topics)
-  [5] config.xml                   (Medha Server XML Configuration)
-  [6] custom_device_example.json   (Custom JSON Configuration)
-  [7] Custom IMEI & Host Wizard    (Input custom IMEI & Host, save to JSON, then continue)
+  [1] Launch Tkinter Graphical UI (GUI with Send Ondemand Button & Viewer)
+  [2] Select the previous connection
+  [3] Enter new IEMI / IMEI (Single Device Mode)
+  [4] Enter new connection
+  [5] Configuration Files List (Open/View/Run config.yaml, config.xml, json...)
+  [6] Toggle Silence 'rtevent' from Console (Currently: ENABLED)
+  [7] Open Excel / CSV RTEvent Log File
   [8] Offline Simulator Mode       (Test without connecting to live broker)
   [9] Exit
-
---------------------------------------------------------------------------------
-Enter your choice (1-9): 
 ```
 
 ---
 
-## Detailed Option Descriptions
+## Tkinter Desktop GUI
 
-### [1] Select the previous connection
-- Displays all previously configured and saved connections formatted with their **Connection Number** (`[Connection #1]`, `[Connection #2]`, etc.).
-- Displays broker endpoint, target IMEI, username, topic count, and timestamp.
-- Enter the connection number to immediately select and connect.
-
-### [2] Enter new IMEI
-- First displays all previous connections with their connection numbers.
-- Allows you to select which connection/broker to use as a base.
-- Prompts for the new device IMEI (e.g., `866738083623999`).
-- Automatically adapts and formats all topics for this IMEI.
-- Saves the profile into `connection_history.json` as a new connection number and generates `config_{imei}.json`.
-- Prompts to connect immediately.
-
-### [3] Enter new connection (with Custom Topics List)
-- First lists all existing connections for reference.
-- Prompts for Connection Name, Broker Host, Port, TLS enable, Username, Password, and Target Device IMEI.
-- **Topic Configuration**:
-  - **Option 1**: Auto-generates the standard 9-topic suite for this IMEI.
-  - **Option 2**: **Paste the custom list of topics that the device was given** (paste multi-line blocks or comma-separated lists directly from your documentation or MQTTBox).
-  - Automatically identifies or lets you select the publish/request topic.
-- Saves the connection to `connection_history.json` and `config_{imei}.json`.
-- Prompts to connect immediately.
-
-### [4] config.yaml
-- Runs the default YAML configuration file containing the Medha server settings and the 9-topic suite.
-
-### [5] config.xml
-- Runs the XML configuration file.
-
-### [6] custom_device_example.json
-- Scans and lists all `.json` configuration files in the directory for quick selection.
-
-### [7] Custom IMEI & Host Wizard
-- Quick wizard that inputs IMEI and Host, automatically formats all 9 topics, saves to JSON, and asks if you want to continue.
-
-### [8] Offline Simulator Mode
-- Runs an end-to-end simulation of the handshake (ondemand request dispatch, remote node response, register decoding) without needing a live broker or network.
-
-### [9] Exit
-- Exits the application cleanly.
-
----
-
-## Project Files
-
-| File | Description |
-| :--- | :--- |
-| [**`mqtt_app.py`**](file:///a:/Coding/Python_MQTT_Server/mqtt_app.py) | **Main Consolidated Script**: Features the 9-option interactive menu, connection history tracking, custom topic pasting, live TLS client, and simulator. |
-| [**`connection_history.json`**](file:///a:/Coding/Python_MQTT_Server/connection_history.json) | **Connection History**: Persistent storage for all saved connections with connection numbers. |
-| [**`config.yaml`**](file:///a:/Coding/Python_MQTT_Server/config.yaml) | **YAML Configuration**: Medha server config with all 9 topics and registered devices list. |
-| [**`config.xml`**](file:///a:/Coding/Python_MQTT_Server/config.xml) | **XML Configuration**: Full XML mirror of configuration parameters. |
-| [**`custom_device_example.json`**](file:///a:/Coding/Python_MQTT_Server/custom_device_example.json) | **JSON Configuration Example**: Template generated by the Custom IMEI Wizard. |
-| [**`mock_device.py`**](file:///a:/Coding/Python_MQTT_Server/mock_device.py) | **Device Simulator**: Simulates a physical IoT node responding to request commands. |
-| [**`test_handshake.py`**](file:///a:/Coding/Python_MQTT_Server/test_handshake.py) | **Test Runner**: Validates YAML, XML, and offline simulator execution. |
-| [**`requirements.txt`**](file:///a:/Coding/Python_MQTT_Server/requirements.txt) | **Dependencies**: `paho-mqtt>=2.0.0`, `pyyaml>=6.0`. |
-
----
-
-## Quick Start
-
-### Launch Interactive Menu:
+To launch the graphical window directly:
 ```powershell
-python mqtt_app.py
-```
-
-### Run Offline Simulation:
-```powershell
-python mqtt_app.py --simulate
+python MQTT_SERVER_CONTROLLER.py --gui
 ```

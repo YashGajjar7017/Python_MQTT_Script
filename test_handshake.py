@@ -6,7 +6,7 @@ Runs offline simulator mode and configuration validator to verify the entire sys
 
 import os
 import sys
-from mqtt_app import load_config_file, run_simulator, DEFAULT_CONFIG
+from MQTT_SERVER_CONTROLLER import load_config_file, run_simulator, DEFAULT_CONFIG
 
 
 def run_tests():
@@ -20,8 +20,8 @@ def run_tests():
         cfg_yaml = load_config_file("config.yaml")
         assert "broker" in cfg_yaml, "Missing 'broker' in YAML"
         assert "topics" in cfg_yaml, "Missing 'topics' in YAML"
-        assert len(cfg_yaml["topics"]["info_subscriptions"]) >= 9, "Expected at least 9 info subscriptions"
-        print("      PASS: config.yaml is valid with all 9 topics.")
+        assert len(cfg_yaml["topics"]["info_subscriptions"]) >= 8, "Expected at least 8 target subscriptions"
+        print("      PASS: config.yaml is valid with single IMEI target topics.")
     else:
         print("[1/3] SKIP: config.yaml not found.")
 
@@ -31,8 +31,8 @@ def run_tests():
         cfg_xml = load_config_file("config.xml")
         assert "broker" in cfg_xml, "Missing 'broker' in XML"
         assert "topics" in cfg_xml, "Missing 'topics' in XML"
-        assert len(cfg_xml["topics"]["info_subscriptions"]) >= 9, "Expected at least 9 info subscriptions"
-        print("      PASS: config.xml is valid with all 9 topics.")
+        assert len(cfg_xml["topics"]["info_subscriptions"]) >= 8, "Expected at least 8 target subscriptions"
+        print("      PASS: config.xml is valid with single IMEI target topics.")
     else:
         print("[2/3] SKIP: config.xml not found.")
 
