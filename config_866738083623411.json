@@ -1,0 +1,57 @@
+{
+  "broker": {
+    "name": "Medha Server",
+    "host": "iot.medha-res.com",
+    "port": 8883,
+    "protocol": "mqtts",
+    "client_id": "f915acbe-0d4e-4de2-9204-134295a904bc",
+    "append_timestamp": true,
+    "username": "InternalUser",
+    "password": "",
+    "keepalive": 10,
+    "clean_session": true,
+    "use_tls": true
+  },
+  "topics": {
+    "ondemand_sub_template": "rtsg-1/ongridrooftop/866738083623411/ondemand/sub",
+    "config_sub_template": "rtsg-1/ongridrooftop/866738083623411/config/sub",
+    "messagekey_sub_template": "rtsg-1/ongridrooftop/866738083623411/messagekey/sub",
+    "info_sub_template": "rtsg-1/ongridrooftop/866738083623411/info/sub",
+    "data_pub_template": "rtsg-1/ongridrooftop/866738083623411/data/pub",
+    "heartbeat_pub_template": "rtsg-1/ongridrooftop/866738083623411/heartbeat/pub",
+    "ondemand_pub_template": "rtsg-1/ongridrooftop/866738083623411/ondemand/pub",
+    "config_pub_template": "rtsg-1/ongridrooftop/866738083623411/config/pub",
+    "rtevent_pub_template": "rtsg-1/ongridrooftop/866738083623411/rtevent/pub",
+    "info_subscriptions": [
+      "rtsg-1/ongridrooftop/866738083623411/data/pub",
+      "rtsg-1/ongridrooftop/866738083623411/heartbeat/pub",
+      "rtsg-1/ongridrooftop/866738083623411/ondemand/pub",
+      "rtsg-1/ongridrooftop/866738083623411/config/pub",
+      "rtsg-1/ongridrooftop/866738083623411/ondemand/sub",
+      "rtsg-1/ongridrooftop/866738083623411/config/sub",
+      "rtsg-1/ongridrooftop/866738083623411/messagekey/sub",
+      "rtsg-1/ongridrooftop/866738083623411/info/sub",
+      "rtsg-1/ongridrooftop/866738083623411/rtevent/pub",
+      "rtsg-1/ongridrooftop/+/data/pub",
+      "rtsg-1/ongridrooftop/+/heartbeat/pub",
+      "rtsg-1/ongridrooftop/+/ondemand/pub",
+      "rtsg-1/ongridrooftop/+/config/pub",
+      "rtsg-1/ongridrooftop/+/rtevent/pub"
+    ]
+  },
+  "settings": {
+    "auto_poll": true,
+    "poll_interval_seconds": 15,
+    "response_timeout_seconds": 10,
+    "payload_to_send": "asas"
+  },
+  "registered_devices": [
+    {
+      "imei": "866738083623411",
+      "name": "Rajasthan_Testing",
+      "device_type": "ONGRID_ROOFTOP_SOLAR",
+      "location": "Site Custom",
+      "enabled": true
+    }
+  ]
+}

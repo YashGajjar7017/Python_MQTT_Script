@@ -2,11 +2,15 @@
 """
 MQTT Remote Device Controller & Request Handler
 Supports:
-  - Interactive selection menu (YAML, XML, JSON, Wizard, Simulator)
-  - Custom IMEI & Host Wizard with auto-generated 9-topic suite
-  - Live MQTTS over TLS (e.g. iot.medha-res.com:8883)
-  - Request/Response & ACK handshake tracking
-  - Built-in Offline Device Simulator
+  [1] Select Previous Connection (Numbered list of all previous saved connections)
+  [2] Enter New IEMI / IMEI (Select base connection and configure new IMEI)
+  [3] Enter New Connection (Input broker details, IMEI, and paste custom device topics list)
+  [4] config.yaml (Default Medha Server YAML Config - 9 Topics)
+  [5] config.xml (Medha Server XML Configuration)
+  [6] custom_device_example.json (Custom JSON Configuration)
+  [7] Custom IMEI & Host Wizard (Quick wizard to input IMEI & Host, save to JSON, then continue)
+  [8] Offline Simulator Mode (Test without connecting to live broker)
+  [9] Exit
 """
 
 import sys
@@ -31,6 +35,8 @@ try:
     HAS_PAHO = True
 except ImportError:
     HAS_PAHO = False
+
+HISTORY_FILE = "connection_history.json"
 
 DEFAULT_CONFIG = {
     "broker": {
@@ -91,15 +97,379 @@ DEFAULT_CONFIG = {
 }
 
 
+def load_connection_history():
+    """Loads connection history from JSON file or initializes with default connection #1."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+                if isinstance(history, list) and len(history) > 0:
+                    return history
+        except Exception:
+            pass
+
+    # Initialize with default connection #1
+    initial_history = [
+        {
+            "connection_num": 1,
+            "name": "Medha Server Default",
+            "host": "iot.medha-res.com",
+            "port": 8883,
+            "use_tls": True,
+            "username": "InternalUser",
+            "imei": "866738083623411",
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "config": DEFAULT_CONFIG
+        }
+    ]
+    save_connection_history(initial_history)
+    return initial_history
+
+
+def save_connection_history(history):
+    """Saves connection history list to JSON file."""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"[!] Warning: Could not save connection history: {e}")
+
+
+def add_to_connection_history(name, host, port, use_tls, username, imei, config):
+    """Adds a new connection record to history and returns the updated history and entry."""
+    history = load_connection_history()
+    next_num = len(history) + 1
+    new_entry = {
+        "connection_num": next_num,
+        "name": name or f"Connection #{next_num} ({host})",
+        "host": host,
+        "port": port,
+        "use_tls": use_tls,
+        "username": username,
+        "imei": imei,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "config": config
+    }
+    history.append(new_entry)
+    save_connection_history(history)
+    return history, new_entry
+
+
+def print_previous_connections(history):
+    """Lists all previous connections formatted with their connection numbers."""
+    print("\n" + "=" * 80)
+    print("                    PREVIOUS SAVED CONNECTIONS")
+    print("=" * 80)
+    for item in history:
+        c_num = item.get("connection_num", 1)
+        c_name = item.get("name", "Unnamed Connection")
+        host = item.get("host", "N/A")
+        port = item.get("port", "N/A")
+        tls = item.get("use_tls", False)
+        imei = item.get("imei", "N/A")
+        user = item.get("username", "None")
+        ts = item.get("timestamp", "N/A")
+        topic_count = len(item.get("config", {}).get("topics", {}).get("info_subscriptions", []))
+
+        print(f"  [Connection #{c_num}] {c_name}")
+        print(f"    * Endpoint    : {host}:{port} (TLS: {tls})")
+        print(f"    * Device IMEI : {imei}")
+        print(f"    * Username    : {user}")
+        print(f"    * Topics      : {topic_count} subscription topic(s)")
+        print(f"    * Saved Date  : {ts}")
+        print("-" * 80)
+
+
+def generate_9_topics_for_imei(imei):
+    """Generates standard 9-topic suite for a specific IMEI."""
+    return {
+        "ondemand_sub_template": f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
+        "config_sub_template": f"rtsg-1/ongridrooftop/{imei}/config/sub",
+        "messagekey_sub_template": f"rtsg-1/ongridrooftop/{imei}/messagekey/sub",
+        "info_sub_template": f"rtsg-1/ongridrooftop/{imei}/info/sub",
+        "data_pub_template": f"rtsg-1/ongridrooftop/{imei}/data/pub",
+        "heartbeat_pub_template": f"rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
+        "ondemand_pub_template": f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
+        "config_pub_template": f"rtsg-1/ongridrooftop/{imei}/config/pub",
+        "rtevent_pub_template": f"rtsg-1/ongridrooftop/{imei}/rtevent/pub",
+        "info_subscriptions": [
+            f"rtsg-1/ongridrooftop/{imei}/data/pub",
+            f"rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
+            f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
+            f"rtsg-1/ongridrooftop/{imei}/config/pub",
+            f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
+            f"rtsg-1/ongridrooftop/{imei}/config/sub",
+            f"rtsg-1/ongridrooftop/{imei}/messagekey/sub",
+            f"rtsg-1/ongridrooftop/{imei}/info/sub",
+            f"rtsg-1/ongridrooftop/{imei}/rtevent/pub",
+            "rtsg-1/ongridrooftop/+/data/pub",
+            "rtsg-1/ongridrooftop/+/heartbeat/pub",
+            "rtsg-1/ongridrooftop/+/ondemand/pub",
+            "rtsg-1/ongridrooftop/+/config/pub",
+            "rtsg-1/ongridrooftop/+/rtevent/pub"
+        ]
+    }
+
+
+def select_previous_connection_action():
+    """Option 1: Lists previous connections and connects to selected one."""
+    history = load_connection_history()
+    print_previous_connections(history)
+
+    choice = input(f"Select Connection Number (1-{len(history)}, or 0 to back): ").strip()
+    if choice == "0" or not choice:
+        return None
+
+    try:
+        sel_idx = int(choice) - 1
+        if 0 <= sel_idx < len(history):
+            selected = history[sel_idx]
+            print(f"\n[+] Selected [Connection #{selected['connection_num']}]: {selected['name']}")
+            print(f"    Broker: {selected['host']}:{selected['port']} | Target IMEI: {selected['imei']}")
+            run_live_client(selected["config"])
+        else:
+            print("[!] Invalid connection number.")
+    except ValueError:
+        print("[!] Please enter a valid number.")
+
+
+def enter_new_imei_action():
+    """Option 2: Lists previous connections, selects one as template or enters new IMEI."""
+    history = load_connection_history()
+    print_previous_connections(history)
+
+    print("\nSelect which base connection to use for the new IMEI:")
+    base_choice = input(f"Enter Connection Number (1-{len(history)}, default: 1): ").strip()
+    base_idx = 0
+    if base_choice:
+        try:
+            val = int(base_choice) - 1
+            if 0 <= val < len(history):
+                base_idx = val
+        except ValueError:
+            pass
+
+    base_entry = history[base_idx]
+    base_cfg = base_entry["config"]
+    broker_cfg = base_cfg.get("broker", {})
+    print(f"\nUsing Base Connection #{base_entry['connection_num']}: {base_entry['name']} ({broker_cfg.get('host')})")
+
+    new_imei = input("Enter New Target Device IMEI (e.g. 866738083623999): ").strip()
+    if not new_imei:
+        print("[!] IMEI cannot be empty.")
+        return
+
+    dev_name = input(f"Enter Device Name (default: Unit-{new_imei}): ").strip()
+    if not dev_name:
+        dev_name = f"Unit-{new_imei}"
+
+    # Build new config
+    new_cfg = json.loads(json.dumps(base_cfg))
+    new_cfg["topics"] = generate_9_topics_for_imei(new_imei)
+    new_cfg["registered_devices"] = [
+        {
+            "imei": new_imei,
+            "name": dev_name,
+            "device_type": "ONGRID_ROOFTOP_SOLAR",
+            "location": "Site Custom",
+            "enabled": True
+        }
+    ]
+
+    # Save to history
+    conn_name = f"{broker_cfg.get('name', 'Server')} - IMEI {new_imei}"
+    history, added = add_to_connection_history(
+        conn_name,
+        broker_cfg.get("host", "iot.medha-res.com"),
+        broker_cfg.get("port", 8883),
+        broker_cfg.get("use_tls", True),
+        broker_cfg.get("username", "InternalUser"),
+        new_imei,
+        new_cfg
+    )
+
+    # Save to JSON file as well
+    out_file = f"config_{new_imei}.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(new_cfg, f, indent=2)
+
+    print(f"\n[+] Success: New connection registered as [Connection #{added['connection_num']}]!")
+    print(f"    Configuration saved to '{out_file}' and connection history.")
+    print(f"    Target IMEI : {new_imei}")
+    print(f"    Publish     : {new_cfg['topics']['ondemand_sub_template']}")
+    print(f"    Subscribe   : {new_cfg['topics']['ondemand_pub_template']}")
+    print(f"    Total Topics: {len(new_cfg['topics']['info_subscriptions'])}")
+
+    cont = input("\nDo you want to connect now with this new IMEI? (y/n, default: y): ").strip().lower()
+    if cont not in ["n", "no"]:
+        run_live_client(new_cfg)
+
+
+def enter_new_connection_action():
+    """Option 3: Inputs connection parameters, IMEI, and allows pasting custom topic list."""
+    history = load_connection_history()
+    print_previous_connections(history)
+
+    print("\n" + "=" * 80)
+    print("                     ENTER NEW MQTT CONNECTION")
+    print("=" * 80)
+    print("Configure a new broker connection, target device IMEI, and custom topic list.\n")
+
+    conn_name = input("Enter Connection Name (e.g. Medha Site 2, Factory Gateway): ").strip()
+    host = input("Enter Broker Host (e.g. iot.medha-res.com or IP): ").strip()
+    if not host:
+        host = "iot.medha-res.com"
+        print(f"  -> Using default host: {host}")
+
+    port_in = input("Enter Broker Port (default: 8883): ").strip()
+    port = int(port_in) if port_in else 8883
+
+    tls_in = input("Enable TLS/SSL? (y/n, default: y): ").strip().lower()
+    use_tls = tls_in != "n"
+
+    username = input("Enter Username (default: InternalUser): ").strip()
+    if not username:
+        username = "InternalUser"
+
+    password = getpass.getpass("Enter Password (leave empty if none): ")
+
+    imei = input("Enter Target Device IMEI (e.g. 866738083623411): ").strip()
+    if not imei:
+        imei = "866738083623411"
+        print(f"  -> Using default IMEI: {imei}")
+
+    print("\n" + "-" * 80)
+    print("TOPIC CONFIGURATION METHOD:")
+    print("  [1] Auto-generate standard 9-topic suite for this IMEI")
+    print("  [2] Paste the custom list of topics that device was given")
+    print("-" * 80)
+
+    t_choice = input("Select option (1 or 2, default: 2): ").strip()
+
+    if t_choice == "1":
+        topics_cfg = generate_9_topics_for_imei(imei)
+    else:
+        print("\n" + "=" * 80)
+        print("PASTE TOPIC LIST:")
+        print("Paste your topics below (one per line, or comma-separated).")
+        print("When finished pasting, press Enter on an empty line (or enter 'END'):")
+        print("=" * 80)
+
+        pasted_topics = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if not line or line.strip().upper() == "END":
+                break
+            # Support comma or newline separated
+            parts = [p.strip() for p in line.replace(",", "\n").replace(";", "\n").split("\n") if p.strip()]
+            for p in parts:
+                if p not in pasted_topics:
+                    pasted_topics.append(p)
+
+        if not pasted_topics:
+            print("[!] No topics pasted. Falling back to standard 9-topic suite.")
+            topics_cfg = generate_9_topics_for_imei(imei)
+        else:
+            print(f"\n[+] Captured {len(pasted_topics)} topic(s):")
+            for idx, top in enumerate(pasted_topics, 1):
+                print(f"    [{idx}] {top}")
+
+            default_pub_topic = None
+            for top in pasted_topics:
+                if "ondemand/sub" in top or top.endswith("/sub"):
+                    default_pub_topic = top
+                    break
+            if not default_pub_topic:
+                default_pub_topic = pasted_topics[0]
+
+            print(f"\nDefault publish/request topic detected: {default_pub_topic}")
+            custom_pub = input(f"Press Enter to keep, or enter custom publish topic: ").strip()
+            pub_topic = custom_pub if custom_pub else default_pub_topic
+
+            topics_cfg = {
+                "ondemand_sub_template": pub_topic,
+                "config_sub_template": f"rtsg-1/ongridrooftop/{imei}/config/sub",
+                "messagekey_sub_template": f"rtsg-1/ongridrooftop/{imei}/messagekey/sub",
+                "info_sub_template": f"rtsg-1/ongridrooftop/{imei}/info/sub",
+                "data_pub_template": f"rtsg-1/ongridrooftop/{imei}/data/pub",
+                "heartbeat_pub_template": f"rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
+                "ondemand_pub_template": f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
+                "config_pub_template": f"rtsg-1/ongridrooftop/{imei}/config/pub",
+                "rtevent_pub_template": f"rtsg-1/ongridrooftop/{imei}/rtevent/pub",
+                "info_subscriptions": pasted_topics
+            }
+
+    new_cfg = {
+        "broker": {
+            "name": conn_name or f"Broker-{host}",
+            "host": host,
+            "port": port,
+            "protocol": "mqtts" if use_tls else "mqtt",
+            "client_id": "f915acbe-0d4e-4de2-9204-134295a904bc",
+            "append_timestamp": True,
+            "username": username,
+            "password": password,
+            "keepalive": 10,
+            "clean_session": True,
+            "use_tls": use_tls
+        },
+        "topics": topics_cfg,
+        "settings": {
+            "auto_poll": True,
+            "poll_interval_seconds": 15,
+            "response_timeout_seconds": 10,
+            "payload_to_send": "asas"
+        },
+        "registered_devices": [
+            {
+                "imei": imei,
+                "name": conn_name or f"Device-{imei}",
+                "device_type": "ONGRID_ROOFTOP_SOLAR",
+                "location": "Configured Site",
+                "enabled": True
+            }
+        ]
+    }
+
+    # Save to connection history
+    history, added = add_to_connection_history(
+        conn_name or f"Connection to {host}",
+        host,
+        port,
+        use_tls,
+        username,
+        imei,
+        new_cfg
+    )
+
+    out_file = f"config_{imei}.json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(new_cfg, f, indent=2)
+
+    print("\n" + "=" * 80)
+    print(f"[+] Success: New connection registered as [Connection #{added['connection_num']}]!")
+    print(f"    Configuration saved to '{out_file}' and '{HISTORY_FILE}'.")
+    print(f"    Endpoint     : {host}:{port} (TLS: {use_tls})")
+    print(f"    Target IMEI  : {imei}")
+    print(f"    Total Topics : {len(topics_cfg['info_subscriptions'])} subscription topic(s)")
+    print("=" * 80)
+
+    cont = input("\nDo you want to continue and connect to this broker now? (y/n, default: y): ").strip().lower()
+    if cont not in ["n", "no"]:
+        run_live_client(new_cfg)
+
+
 def load_yaml(filepath):
     if HAS_YAML:
         with open(filepath, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
-    
-    # Fallback YAML parser for basic structures when pyyaml is not yet installed
+
     with open(filepath, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    
+
     cfg = {"broker": {}, "topics": {"info_subscriptions": []}, "settings": {}, "registered_devices": []}
     curr_section = None
     curr_dev = None
@@ -108,12 +478,11 @@ def load_yaml(filepath):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        
-        # Check top-level section
+
         if not line.startswith(" ") and not line.startswith("\t") and stripped.endswith(":"):
             curr_section = stripped[:-1].strip()
             continue
-        
+
         if curr_section == "broker":
             if ":" in stripped:
                 k, v = stripped.split(":", 1)
@@ -289,33 +658,7 @@ def custom_wizard():
             "clean_session": True,
             "use_tls": use_tls
         },
-        "topics": {
-            "ondemand_sub_template": f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
-            "config_sub_template": f"rtsg-1/ongridrooftop/{imei}/config/sub",
-            "messagekey_sub_template": f"rtsg-1/ongridrooftop/{imei}/messagekey/sub",
-            "info_sub_template": f"rtsg-1/ongridrooftop/{imei}/info/sub",
-            "data_pub_template": f"rtsg-1/ongridrooftop/{imei}/data/pub",
-            "heartbeat_pub_template": f"rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
-            "ondemand_pub_template": f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
-            "config_pub_template": f"rtsg-1/ongridrooftop/{imei}/config/pub",
-            "rtevent_pub_template": f"rtsg-1/ongridrooftop/{imei}/rtevent/pub",
-            "info_subscriptions": [
-                f"rtsg-1/ongridrooftop/{imei}/data/pub",
-                f"rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
-                f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
-                f"rtsg-1/ongridrooftop/{imei}/config/pub",
-                f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
-                f"rtsg-1/ongridrooftop/{imei}/config/sub",
-                f"rtsg-1/ongridrooftop/{imei}/messagekey/sub",
-                f"rtsg-1/ongridrooftop/{imei}/info/sub",
-                f"rtsg-1/ongridrooftop/{imei}/rtevent/pub",
-                "rtsg-1/ongridrooftop/+/data/pub",
-                "rtsg-1/ongridrooftop/+/heartbeat/pub",
-                "rtsg-1/ongridrooftop/+/ondemand/pub",
-                "rtsg-1/ongridrooftop/+/config/pub",
-                "rtsg-1/ongridrooftop/+/rtevent/pub"
-            ]
-        },
+        "topics": generate_9_topics_for_imei(imei),
         "settings": {
             "auto_poll": True,
             "poll_interval_seconds": 15,
@@ -335,6 +678,9 @@ def custom_wizard():
 
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+    # Save to history
+    add_to_connection_history(f"Wizard - {host} ({imei})", host, port, use_tls, username, imei, cfg)
 
     print("\n" + "=" * 70)
     print(f"[+] Success: Custom configuration saved to '{out_file}'!")
@@ -449,12 +795,9 @@ def run_live_client(config, once=False, cli_password=None):
         print(f"  * [{status}] IMEI: {imei} | {d.get('name', '')} ({d.get('device_type', '')})")
     print("=" * 80)
 
-    # Initialize MQTT client
     try:
-        # Paho v2 callback api support
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id, clean_session=clean_session)
     except AttributeError:
-        # Paho v1 fallback
         client = mqtt.Client(client_id=client_id, clean_session=clean_session)
 
     if username:
@@ -477,7 +820,6 @@ def run_live_client(config, once=False, cli_password=None):
         if rc_code == 0:
             print("\n[+] Successfully connected to MQTT Broker!")
             state["connected"] = True
-            # Subscribe to info subscriptions
             subs = topics.get("info_subscriptions", [])
             for s in subs:
                 cli.subscribe(s, qos=0)
@@ -493,7 +835,6 @@ def run_live_client(config, once=False, cli_password=None):
             rtt = (time.time() - state["last_dispatch_time"]) * 1000
             rtt_str = f" | RTT: {rtt:.1f} ms"
 
-        # Check matching registered device
         matched_dev = None
         for imei, d in devices.items():
             if imei in topic:
@@ -508,7 +849,6 @@ def run_live_client(config, once=False, cli_password=None):
         print(f"Timestamp   : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC{rtt_str}")
         print("-" * 80)
 
-        # Parse JSON or formatted string
         try:
             data = json.loads(payload_str)
             print("Parsed Payload Breakdown (JSON):")
@@ -537,7 +877,6 @@ def run_live_client(config, once=False, cli_password=None):
         client.connect(host, port, keepalive)
         client.loop_start()
 
-        # Wait for connection
         t0 = time.time()
         while not state["connected"] and (time.time() - t0) < 8:
             time.sleep(0.2)
@@ -547,14 +886,13 @@ def run_live_client(config, once=False, cli_password=None):
             client.loop_stop()
             return
 
-        # Dispatch ondemand requests to enabled registered devices
         target_imeis = [imei for imei, d in devices.items() if d.get("enabled", True)]
         if not target_imeis:
             target_imeis = ["866738083623411"]
 
         for imei in target_imeis:
             sub_template = topics.get("ondemand_sub_template", "rtsg-1/ongridrooftop/{imei}/ondemand/sub")
-            target_topic = sub_template.format(imei=imei)
+            target_topic = sub_template.format(imei=imei) if "{imei}" in sub_template else sub_template
             print("\n>>> [ONDEMAND FETCH REQUEST DISPATCHED] >>>")
             dev_name = devices.get(imei, {}).get("name", "Unknown Device")
             print(f"  Target Device : {dev_name} (IMEI: {imei})")
@@ -564,7 +902,6 @@ def run_live_client(config, once=False, cli_password=None):
             state["last_dispatch_time"] = time.time()
             client.publish(target_topic, payload_to_send, qos=0)
 
-        # Loop
         if once:
             timeout = settings.get("response_timeout_seconds", 10)
             wait_start = time.time()
@@ -580,7 +917,8 @@ def run_live_client(config, once=False, cli_password=None):
                 time.sleep(1)
                 if settings.get("auto_poll", True) and (time.time() - last_poll) >= poll_interval:
                     for imei in target_imeis:
-                        target_topic = topics.get("ondemand_sub_template", "rtsg-1/ongridrooftop/{imei}/ondemand/sub").format(imei=imei)
+                        sub_template = topics.get("ondemand_sub_template", "rtsg-1/ongridrooftop/{imei}/ondemand/sub")
+                        target_topic = sub_template.format(imei=imei) if "{imei}" in sub_template else sub_template
                         client.publish(target_topic, payload_to_send, qos=0)
                     last_poll = time.time()
 
@@ -598,16 +936,33 @@ def main_menu():
         print("              MQTT REMOTE DEVICE CONTROLLER - MAIN SELECTION MENU")
         print("=" * 80)
         print("\nPlease select a Configuration File or Action:\n")
-        print("  [1] config.yaml                  (Default Medha Server YAML Config - 9 Topics)")
-        print("  [2] config.xml                   (Medha Server XML Configuration)")
-        print("  [3] custom_device_example.json   (Custom JSON Configuration)")
-        print("  [4] Custom IMEI & Host Wizard    (Input custom IMEI & Host, save to JSON, then continue)")
-        print("  [5] Offline Simulator Mode       (Test without connecting to live broker)")
-        print("  [6] Exit\n")
+        print("  [1] Select the previous connection")
+        print("  [2] Enter new IEMI / IMEI")
+        print("  [3] Enter new connection")
+        print("  [4] config.yaml                  (Default Medha Server YAML Config - 9 Topics)")
+        print("  [5] config.xml                   (Medha Server XML Configuration)")
+        print("  [6] custom_device_example.json   (Custom JSON Configuration)")
+        print("  [7] Custom IMEI & Host Wizard    (Input custom IMEI & Host, save to JSON, then continue)")
+        print("  [8] Offline Simulator Mode       (Test without connecting to live broker)")
+        print("  [9] Exit\n")
         print("-" * 80)
 
-        choice = input("Enter your choice (1-6): ").strip()
+        choice = input("Enter your choice (1-9): ").strip()
+
         if choice == "1":
+            # 1. Select the previous connection
+            select_previous_connection_action()
+
+        elif choice == "2":
+            # 2. Enter new IMEI
+            enter_new_imei_action()
+
+        elif choice == "3":
+            # 3. Enter new connection (with IMEI & paste topic list)
+            enter_new_connection_action()
+
+        elif choice == "4":
+            # 4. config.yaml
             cfg_path = "config.yaml"
             if not os.path.exists(cfg_path):
                 print(f"[!] {cfg_path} not found. Using defaults.")
@@ -615,16 +970,20 @@ def main_menu():
             else:
                 cfg = load_config_file(cfg_path)
             run_live_client(cfg)
-        elif choice == "2":
+
+        elif choice == "5":
+            # 5. config.xml
             cfg_path = "config.xml"
             if not os.path.exists(cfg_path):
                 print(f"[!] {cfg_path} not found.")
                 continue
             cfg = load_config_file(cfg_path)
             run_live_client(cfg)
-        elif choice == "3":
-            # Search for available json configs
+
+        elif choice == "6":
+            # 6. custom_device_example.json
             json_files = glob.glob("*.json")
+            json_files = [f for f in json_files if f != HISTORY_FILE]
             if not json_files:
                 print("[!] No JSON configuration files found in folder.")
                 continue
@@ -641,19 +1000,26 @@ def main_menu():
                     print("[!] Invalid index.")
             except ValueError:
                 print("[!] Invalid input.")
-        elif choice == "4":
+
+        elif choice == "7":
+            # 7. Custom IMEI & Host Wizard
             cfg = custom_wizard()
             if cfg:
                 run_live_client(cfg)
-        elif choice == "5":
+
+        elif choice == "8":
+            # 8. Offline Simulator Mode
             cfg_path = "config.yaml"
             cfg = load_config_file(cfg_path) if os.path.exists(cfg_path) else DEFAULT_CONFIG
             run_simulator(cfg)
-        elif choice == "6":
+
+        elif choice == "9":
+            # 9. Exit
             print("\nExiting MQTT Remote Device Controller. Goodbye!")
             sys.exit(0)
+
         else:
-            print("\n[!] Invalid selection. Please enter a number between 1 and 6.")
+            print("\n[!] Invalid selection. Please enter a number between 1 and 9.")
 
 
 def main():
