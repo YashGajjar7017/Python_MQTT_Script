@@ -52,6 +52,7 @@ settings:
   poll_interval_seconds: 15
   response_timeout_seconds: 30
   payload_to_send: "asas"
+  auto_reply_messagekey: true              # Automatically send ondemand request 'asas' when device messagekey arrives!
   target_imei_only: true                   # Only process & print target IMEI (filters out other devices)
   rtevent_display_mode: "compact"          # "compact" = 1-line clean summary, "full" = multiline box, "silent" = no console print
 

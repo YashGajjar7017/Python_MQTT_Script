@@ -1,27 +1,43 @@
 # MQTT SCADA & Ondemand Controller
 
-A Python MQTT controller and telemetry processor featuring single-IMEI targeting, terminal noise silencing, Tkinter desktop GUI with dedicated Ondemand command dispatching, real-time response viewer, and command-line configuration file manager.
+A Python MQTT controller and telemetry processor featuring single-IMEI targeting, terminal noise silencing, Tkinter desktop GUI with dedicated Modbus & GPRS Connection Register Explorer, real-time response viewer, ondemand fetching, and command-line configuration file manager.
 
 ---
 
 ## Key Updates & Features
 
-### 1. Single IMEI Subscription (No Server-Wide Wildcards)
-- Removed all `+` wildcards (`rtsg-1/ongridrooftop/+/...`).
-- Subscribes strictly to the **target IMEI** (e.g. `866738083619898`), preventing messages from other server devices from flooding your session.
-- **Silence `rtevent` from console**: `skip_rtevent_console: true` silences high-frequency `rtevent` messages from spamming the terminal, while still logging them safely to `rtevent_logs.csv` in the background.
+### 1. 🔌 Modbus & GPRS Register Explorer (GUI Tab 1)
+- Built-in database of all 300+ Modbus / SCADA registers from the device firmware defines.
+- **Instant Search & Filters**:
+  - Live search as you type (e.g. `GPRS`, `IP`, `PORT`, `APN`, `SIM`, `RSSI`, or register addresses like `3354`).
+  - Quick-preset buttons:
+    - **`🌐 Show GPRS List`**: Instantly isolates all cellular, APN, IP, port, and network status registers.
+    - **`🔌 IP & WiFi`**: Displays local IP, subnet mask, gateway, DNS, and WiFi configurations.
+    - **`⚡ Solar & Power`**: Voltage, current, power thresholds, inverter metrics, and grid supply.
+    - **`⚙️ System & CPU`**: Firmware version, RTC clock, watchdog, CPU status, and reset flags.
+    - **`📋 Show All`**: View all 300+ Modbus registers with addresses and descriptions.
+- **Ondemand Live Fetch Actions**:
+  - **`🚀 FETCH CURRENT VALUES (ONDEMAND)`**: Publishes ondemand fetch (`asas`) to `rtsg-1/ongridrooftop/{imei}/ondemand/sub`.
+  - **`🌐 FETCH GPRS LIST VALUES`**: Isolates GPRS registers and immediately queries the device.
+  - **`⚡ Fetch Selected Register`**: Queries the device specifically for the highlighted register row.
+- **Automatic Real-Time Value Updates**:
+  - When the device responds on `.../ondemand/pub`, `.../data/pub`, or `.../rtevent/pub`, incoming values in `registers` or top-level keys are **automatically mapped** into the **"Current Value"** column and **highlighted in green** with live timestamp.
 
-### 2. Tkinter GUI: "Send Ondemand Request" Button & Live Response Viewer
-- **Tab 2 (Send Ondemand Command)** now features:
+### 2. Single IMEI Subscription (No Server-Wide Wildcards)
+- Subscribes strictly to the **target IMEI** (e.g. `rtsg-1/ongridrooftop/866738083619898/#`).
+- Eliminates noise from other devices on the broker.
+- Automatically handles `messagekey/sub` handshake and auto-dispatches ondemand requests.
+
+### 3. Tkinter GUI: "Send Ondemand Request" Button & Live Response Viewer
+- **Tab 2 (Send Ondemand Command)**:
   - **`🚀 SEND ONDEMAND REQUEST` button**: One click immediately publishes the payload (`asas` or custom) to the target device request topic.
-  - **Live Ondemand Response Viewer**: Automatically updates in real time when the remote device replies on `.../ondemand/pub`, breaking down registers (`3345`, `3747`, `4013`, etc.) with millisecond round-trip latency.
+  - **Live Ondemand Response Viewer**: Real-time parsed JSON breakdown of all registers and metrics.
 
-### 3. Option [5]: Configuration Files List in Command Line
-- Entering **`5`** in the main menu displays an interactive file manager right in your terminal:
-  - Lists `config.yaml`, `config.xml`, `server_credentials.json`, `connection_history.json`, etc.
-  - **Enter number** (e.g. `1`): Immediately runs and connects with that config.
-  - **`V <number>`** (e.g. `v 1`): Prints the file contents directly in the terminal.
-  - **`O <number>`** (e.g. `o 1`): Opens the file in Windows Notepad / default editor.
+### 4. Option [3]: Search & Fetch Modbus / GPRS Registers in CLI
+- Allows terminal users to list all GPRS connection registers, search keywords, and trigger live ondemand queries without opening the GUI.
+
+### 5. Option [6]: Configuration Files List in Command Line
+- Manage all `.yaml`, `.xml`, and `.json` configs directly from the terminal.
 
 ---
 

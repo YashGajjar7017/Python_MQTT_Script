@@ -4,9 +4,12 @@
                     MQTT SCADA & RTEVENT SERVER CONTROLLER
 ================================================================================
 Comprehensive MQTT IoT Controller & Telemetry Handler:
-  - Single Target IMEI mode: filters out all other IMEIs from the server
-  - Silences / skips 'rtevent' from terminal console spam while logging to Excel
-  - Tkinter GUI with dedicated 'Send Ondemand Request' button & Auto Response Viewer
+  - Subscribes to target device using 'rtsg-1/ongridrooftop/{imei}/#'
+  - Captures 100% of packets from target device (exactly like in MQTTBox)
+  - Displays compact 1-line telemetry for 'rtevent' (voltage, frequency, power)
+  - Full detailed breakdown for 'ondemand' and 'data' responses
+  - Interactive CLI: Press [Enter] anytime to dispatch ondemand request
+  - Tkinter GUI with dedicated 'Send Ondemand Request' button & Live Response Viewer
   - Option 5: Lists all config files in the device cmd line (Run / View / Open)
   - Auto-saved credentials in server_credentials.json (1-time password entry)
   - Full MQTT v3.1.1 & MQTTS TLS support
@@ -36,6 +39,13 @@ try:
     HAS_PAHO = True
 except ImportError:
     HAS_PAHO = False
+
+try:
+    from modbus_registers import ALL_REGISTERS, search_registers, get_gprs_registers
+except ImportError:
+    ALL_REGISTERS = []
+    search_registers = lambda q="", c="All": []
+    get_gprs_registers = lambda: []
 
 # File Paths
 CREDENTIALS_FILE = "server_credentials.json"
@@ -75,10 +85,12 @@ DEFAULT_CONFIG = {
         "config_pub_template": "rtsg-1/ongridrooftop/{imei}/config/pub",
         "rtevent_pub_template": "rtsg-1/ongridrooftop/{imei}/rtevent/pub",
         "info_subscriptions": [
+            "rtsg-1/ongridrooftop/866738083619898/#",
+            "rtsg-1/ongridrooftop/866738083619898/ondemand/pub",
             "rtsg-1/ongridrooftop/866738083619898/data/pub",
             "rtsg-1/ongridrooftop/866738083619898/heartbeat/pub",
-            "rtsg-1/ongridrooftop/866738083619898/ondemand/pub",
             "rtsg-1/ongridrooftop/866738083619898/config/pub",
+            "rtsg-1/ongridrooftop/866738083619898/rtevent/pub",
             "rtsg-1/ongridrooftop/866738083619898/ondemand/sub",
             "rtsg-1/ongridrooftop/866738083619898/config/sub",
             "rtsg-1/ongridrooftop/866738083619898/messagekey/sub",
@@ -90,9 +102,9 @@ DEFAULT_CONFIG = {
         "poll_interval_seconds": 15,
         "response_timeout_seconds": 30,
         "payload_to_send": "asas",
+        "auto_reply_messagekey": True,
         "target_imei_only": True,
-        "skip_rtevent_console": True,
-        "subscribe_rtevent": False
+        "rtevent_display_mode": "compact"
     },
     "registered_devices": [
         {
@@ -195,10 +207,7 @@ def init_rtevent_csv():
 
 
 def log_rtevent_data(topic, payload_str, data_dict=None):
-    """
-    Appends an incoming 'rtevent' record to rtevent_logs.csv (Excel format)
-    and rtevent_logs.txt in the background.
-    """
+    """Appends an incoming 'rtevent' record to rtevent_logs.csv and rtevent_logs.txt."""
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     d = data_dict or {}
@@ -340,20 +349,20 @@ def print_previous_connections(history):
         print("-" * 80)
 
 
-def generate_single_imei_topics(imei, include_rtevent=False):
-    """Generates subscription topics strictly for a SINGLE IMEI without server-wide wildcards."""
+def generate_single_imei_topics(imei):
+    """Generates subscription topics for a SINGLE IMEI including device-level wildcard #."""
     subs = [
+        f"rtsg-1/ongridrooftop/{imei}/#",
+        f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
         f"rtsg-1/ongridrooftop/{imei}/data/pub",
         f"rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
-        f"rtsg-1/ongridrooftop/{imei}/ondemand/pub",
         f"rtsg-1/ongridrooftop/{imei}/config/pub",
+        f"rtsg-1/ongridrooftop/{imei}/rtevent/pub",
         f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
         f"rtsg-1/ongridrooftop/{imei}/config/sub",
         f"rtsg-1/ongridrooftop/{imei}/messagekey/sub",
         f"rtsg-1/ongridrooftop/{imei}/info/sub"
     ]
-    if include_rtevent:
-        subs.append(f"rtsg-1/ongridrooftop/{imei}/rtevent/pub")
 
     return {
         "ondemand_sub_template": f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
@@ -526,8 +535,8 @@ def load_config_file(filepath):
 def run_live_client(config, once=False, cli_password=None, on_message_callback=None, stop_event=None, on_client_ready=None):
     """
     Connects to MQTT Broker with TLS and MQTT v3.1.1 protocol.
-    Filters subscriptions strictly to target IMEI (no server wildcards).
-    Skips/silences 'rtevent' from terminal console spam while logging in background.
+    Subscribes to target device using '#', capturing 100% of telemetry and ondemand data.
+    Provides interactive terminal dispatch so pressing [Enter] publishes ondemand requests.
     """
     if not HAS_PAHO:
         print("[!] Error: paho-mqtt package is not installed.")
@@ -548,8 +557,7 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
     settings = config.get("settings", {})
     payload_to_send = settings.get("payload_to_send", "asas")
     target_imei_only = bool(settings.get("target_imei_only", True))
-    skip_rtevent_console = bool(settings.get("skip_rtevent_console", True))
-    subscribe_rtevent = bool(settings.get("subscribe_rtevent", False))
+    rtevent_mode = settings.get("rtevent_display_mode", "compact").lower()
 
     devices = {str(d.get("imei")): d for d in config.get("registered_devices", [])}
     target_imei_list = list(devices.keys())
@@ -558,7 +566,6 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
 
     primary_imei = target_imei_list[0]
 
-    # Retrieve password
     password = cli_password or broker.get("password", "")
     if not password:
         password = get_saved_password(host, username, port)
@@ -574,28 +581,28 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
     topics = config.get("topics", {})
     raw_subs = topics.get("info_subscriptions", [])
 
-    # Filter subscriptions: Remove wildcards and optionally skip rtevent
+    # Filter subscriptions: remove global wildcards (+), keep device-level wildcard (#)
     clean_subs = []
     for s in raw_subs:
-        if "+" in s or "#" in s:
-            continue
-        if "rtevent" in s and not subscribe_rtevent:
+        if "+" in s:
             continue
         if s not in clean_subs:
             clean_subs.append(s)
 
-    if not clean_subs:
-        clean_subs = generate_single_imei_topics(primary_imei, include_rtevent=subscribe_rtevent)["info_subscriptions"]
+    # Ensure device-level wildcard for target IMEI is included
+    device_wildcard = f"rtsg-1/ongridrooftop/{primary_imei}/#"
+    if device_wildcard not in clean_subs:
+        clean_subs.insert(0, device_wildcard)
 
     print("\n" + "=" * 80)
     print("       MQTT SCADA & ONDEMAND CONTROLLER")
     print("=" * 80)
     print(f"Broker Endpoint   : {host}:{port} (TLS: {use_tls})")
-    print(f"MQTT Client ID    : {client_id} (append_timestamp={append_ts})")
+    print(f"MQTT Client ID    : {client_id}")
     print(f"MQTT Username     : {username}")
-    print(f"Target Device IMEI: {primary_imei} (Single Device Filter: {target_imei_only})")
-    print(f"Console Filter    : Silence 'rtevent' spam = {skip_rtevent_console}")
-    print(f"Active Subscriptions ({len(clean_subs)} topics):")
+    print(f"Target Device IMEI: {primary_imei} (Device-Scoped Wildcard: Enabled)")
+    print(f"Telemetry Mode    : {rtevent_mode.upper()} (Auto-logged to rtevent_logs.csv)")
+    print(f"Subscribed Topics ({len(clean_subs)} topics):")
     for s in clean_subs:
         print(f"  * {s}")
     print("=" * 80)
@@ -661,10 +668,9 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
             rtt = (time.time() - state["last_dispatch_time"]) * 1000
             rtt_str = f" | RTT: {rtt:.1f} ms"
 
-        # Check if topic belongs to another IMEI when target_imei_only is active
+        # Check if topic belongs to target IMEI
         is_for_target = any(imei in topic for imei in target_imei_list if imei)
         if target_imei_only and not is_for_target:
-            # Skip messages from other devices on the broker
             return
 
         parsed_dict = None
@@ -673,36 +679,73 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
         except Exception:
             pass
 
+        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
         is_rtevent = "rtevent" in topic.lower() or (parsed_dict and "rtevent" in str(parsed_dict).lower())
+
         if is_rtevent:
-            # Log to CSV in the background
+            # 1. Log to Excel/CSV in the background
             log_rtevent_data(topic, payload_str, parsed_dict)
-            if skip_rtevent_console:
-                # Silenced from terminal console!
-                if on_message_callback:
-                    on_message_callback(topic, payload_str, parsed_dict, is_rtevent)
-                return
 
-        # Print ondemand, data, and relevant topics to console
-        print("\n" + "=" * 80)
-        badge = "[ONDEMAND DATA RECEIVED]" if "ondemand" in topic.lower() else "[DEVICE TELEMETRY RECEIVED]"
-        print(f"{badge} Topic: {topic}")
-        print(f"Timestamp : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC{rtt_str}")
-        print("-" * 80)
+            # 2. Console display
+            if rtevent_mode == "compact":
+                d = parsed_dict or {}
+                vn = d.get("IS-1-0---VN", "N/A")
+                freq = d.get("IS-1-0---FREQ", "N/A")
+                pow_w = d.get("IS-1-0---POW", "N/A")
+                idx = d.get("INDEX", "N/A")
+                dev_ts = d.get("TIMESTAMP", d.get("DATE", now_utc))
+                print(f"[{now_utc}] [LIVE TELEMETRY] IMEI: {primary_imei} | VN: {vn}V | FREQ: {freq}Hz | POW: {pow_w}W | INDEX: {idx} | DevTime: {dev_ts}")
+            elif rtevent_mode == "full":
+                print("\n" + "=" * 80)
+                print(f"[RTEVENT TELEMETRY] Topic: {topic} | Time: {now_utc} UTC")
+                print("-" * 80)
+                if parsed_dict:
+                    for k, v in parsed_dict.items():
+                        print(f"  {k:15}: {v}")
+                else:
+                    print(f"  {payload_str}")
+                print("=" * 80)
 
-        if parsed_dict and isinstance(parsed_dict, dict):
-            print("Parsed Payload Breakdown (JSON):")
-            for k, v in parsed_dict.items():
-                if k != "registers":
-                    print(f"  {k}: {v}")
-            if "registers" in parsed_dict:
-                print("  Registers / Metrics:")
-                for reg, val in parsed_dict["registers"].items():
-                    print(f"    * Register [{reg}]: {val}")
+        elif "messagekey" in topic.lower():
+            print("\n" + "=" * 80)
+            print(f"[DEVICE MESSAGEKEY RECEIVED] Topic: {topic}")
+            if parsed_dict:
+                print(f"  CMKEY    : {parsed_dict.get('CMKEY')}")
+                print(f"  PMKEY    : {parsed_dict.get('PMKEY')}")
+                print(f"  Timestamp: {parsed_dict.get('timestamp')}")
+            else:
+                print(f"  Payload  : {payload_str}")
+            print(f"  -> Device '{primary_imei}' is online and active!")
+
+            # Auto-Dispatch ondemand trigger if configured (default True)
+            auto_reply_messagekey = settings.get("auto_reply_messagekey", True)
+            if auto_reply_messagekey:
+                print(f">>> [AUTO-DISPATCH ONDEMAND] Handshake key received -> Sending '{payload_to_send}' to {target_topic} ...")
+                state["last_dispatch_time"] = time.time()
+                cli.publish(target_topic, payload_to_send, qos=0)
+            print("=" * 80)
+
         else:
-            print("Raw Payload Content:")
-            print(f"  {payload_str}")
-        print("=" * 80)
+            # Ondemand, Data, Heartbeat, or other response
+            print("\n" + "=" * 80)
+            badge = "[ONDEMAND DATA RECEIVED]" if "ondemand" in topic.lower() else "[DEVICE DATA RECEIVED]"
+            print(f"{badge} Topic: {topic}")
+            print(f"Timestamp : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC{rtt_str}")
+            print("-" * 80)
+
+            if parsed_dict and isinstance(parsed_dict, dict):
+                print("Parsed Payload Breakdown (JSON):")
+                for k, v in parsed_dict.items():
+                    if k != "registers":
+                        print(f"  {k:15}: {v}")
+                if "registers" in parsed_dict:
+                    print("  Registers / Metrics:")
+                    for reg, val in parsed_dict["registers"].items():
+                        print(f"    * Register [{reg}]: {val}")
+            else:
+                print("Raw Payload Content:")
+                print(f"  {payload_str}")
+            print("=" * 80)
 
         state["got_response"] = True
 
@@ -712,8 +755,30 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
             except Exception:
                 pass
 
+    sub_template = topics.get("ondemand_sub_template", f"rtsg-1/ongridrooftop/{primary_imei}/ondemand/sub")
+    target_topic = sub_template.format(imei=primary_imei) if "{imei}" in sub_template else sub_template
+
     client.on_connect = on_connect
     client.on_message = on_message
+
+    def on_disconnect(cli, userdata, *args):
+        state["connected"] = False
+        rc = args[1] if len(args) > 1 else (args[0] if args else 0)
+        rc_code = rc if isinstance(rc, int) else getattr(rc, "value", rc)
+        now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        if rc_code != 0:
+            print(f"\n[!] [{now_utc} UTC] Disconnected from broker (Reason Code: {rc_code})")
+            print("=" * 80)
+            print("⚠️  WARNING: BROKER TERMINATED CONNECTION!")
+            print(f"  Configured Client ID: '{client_id}'")
+            print("  The MQTT broker allows only ONE active connection per Client ID.")
+            print("  If MQTTBox is currently connected with this Client ID,")
+            print("  the broker automatically kicks Python offline!")
+            print("  👉 SOLUTION: Close or disconnect MQTTBox while running Python,")
+            print("     OR set append_timestamp: true in config.yaml to allow simultaneous connections.")
+            print("=" * 80 + "\n")
+
+    client.on_disconnect = on_disconnect
 
     try:
         print(f"\n[*] Connecting to {host}:{port} (timeout: {connect_timeout}s) ...")
@@ -734,9 +799,6 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
         if on_client_ready:
             on_client_ready(client)
 
-        sub_template = topics.get("ondemand_sub_template", f"rtsg-1/ongridrooftop/{primary_imei}/ondemand/sub")
-        target_topic = sub_template.format(imei=primary_imei) if "{imei}" in sub_template else sub_template
-
         # Initial dispatch
         print(f"\n>>> [DISPATCHING INITIAL ONDEMAND FETCH] >>>")
         print(f"  Publish Topic : {target_topic}")
@@ -750,13 +812,43 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
             while not state["got_response"] and (time.time() - wait_start) < timeout:
                 time.sleep(0.5)
         else:
-            print(f"\n[+] Listening for target IMEI '{primary_imei}'. Press Ctrl+C to stop.\n")
+            print(f"\n[+] Listening for target IMEI '{primary_imei}'.")
+            print("--------------------------------------------------------------------------------")
+            print("  [KEYBOARD SHORTCUT] Press [Enter] anytime to send Ondemand request ('asas')")
+            print("  Type 'q' and press [Enter] to stop and disconnect.")
+            print("--------------------------------------------------------------------------------\n")
+
             poll_interval = settings.get("poll_interval_seconds", 15)
             last_poll = time.time()
+
+            # Interactive keyboard trigger thread
+            def cli_input_worker():
+                while not (stop_event and stop_event.is_set()):
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            break
+                        cmd = line.strip()
+                        if cmd.lower() in ["q", "quit", "exit"]:
+                            if stop_event:
+                                stop_event.set()
+                            break
+                        else:
+                            pay = cmd if cmd else payload_to_send
+                            print(f"\n>>> [MANUAL ONDEMAND DISPATCH] >>> Topic: {target_topic} | Payload: '{pay}'")
+                            state["last_dispatch_time"] = time.time()
+                            client.publish(target_topic, pay, qos=0)
+                    except Exception:
+                        break
+
+            if sys.stdin.isatty():
+                in_thread = threading.Thread(target=cli_input_worker, daemon=True)
+                in_thread.start()
+
             while True:
                 if stop_event and stop_event.is_set():
                     break
-                time.sleep(1)
+                time.sleep(0.5)
                 if settings.get("auto_poll", False) and (time.time() - last_poll) >= poll_interval:
                     client.publish(target_topic, payload_to_send, qos=0)
                     last_poll = time.time()
@@ -774,7 +866,7 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
 # ==============================================================================
 
 def launch_gui(initial_config=None):
-    """Launches the modern Tkinter Graphical Interface."""
+    """Launches the Tkinter Graphical Interface."""
     try:
         import tkinter as tk
         from tkinter import ttk, messagebox, scrolledtext
@@ -834,13 +926,311 @@ def launch_gui(initial_config=None):
     btn_connect = ttk.Button(top_frame, text="Connect")
     btn_connect.grid(row=0, column=9, padx=5)
 
+    # =========================================================================
+    # REGISTER DATA CACHE & MAPPER
+    # =========================================================================
+    REGISTER_CACHE = {r["address"]: dict(r) for r in ALL_REGISTERS}
+    NAME_TO_ADDR = {r["name"].upper(): r["address"] for r in ALL_REGISTERS}
+    current_cat_filter = tk.StringVar(value="All")
+
     # Notebook Tabs
     notebook = ttk.Notebook(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-    # Tab 1: Live Telemetry
+    # -------------------------------------------------------------------------
+    # TAB 1: MODBUS & GPRS REGISTER EXPLORER (SEARCH, FILTER & ONDEMAND FETCH)
+    # -------------------------------------------------------------------------
+    tab_regs = ttk.Frame(notebook)
+    notebook.add(tab_regs, text="  🔌 Modbus & GPRS Register Explorer  ")
+
+    # Search and Filter Toolbar
+    f_filter = ttk.LabelFrame(tab_regs, text="Search & Filter Connection Registers (GPRS, Network, Modbus)", padding=8)
+    f_filter.pack(fill=tk.X, padx=10, pady=4)
+
+    row0 = ttk.Frame(f_filter)
+    row0.pack(fill=tk.X, pady=2)
+
+    ttk.Label(row0, text="🔍 Search / Filter:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(2, 6))
+    entry_reg_search = ttk.Entry(row0, width=24, font=("Segoe UI", 9))
+    entry_reg_search.insert(0, "GPRS")
+    entry_reg_search.pack(side=tk.LEFT, padx=4)
+
+    def on_search_gprs_btn():
+        entry_reg_search.delete(0, tk.END)
+        entry_reg_search.insert(0, "GPRS")
+        current_cat_filter.set("All")
+        apply_filter_regs()
+
+    def on_search_net_btn():
+        entry_reg_search.delete(0, tk.END)
+        entry_reg_search.insert(0, "IP")
+        current_cat_filter.set("All")
+        apply_filter_regs()
+
+    def on_search_solar_btn():
+        entry_reg_search.delete(0, tk.END)
+        entry_reg_search.insert(0, "VOLT")
+        current_cat_filter.set("All")
+        apply_filter_regs()
+
+    def on_search_sys_btn():
+        entry_reg_search.delete(0, tk.END)
+        entry_reg_search.insert(0, "SYS")
+        current_cat_filter.set("All")
+        apply_filter_regs()
+
+    def on_show_all_btn():
+        entry_reg_search.delete(0, tk.END)
+        current_cat_filter.set("All")
+        apply_filter_regs()
+
+    btn_pre_gprs = tk.Button(row0, text="🌐 Show GPRS List", command=on_search_gprs_btn, font=("Segoe UI", 9, "bold"), bg="#e3f2fd", fg="#0d47a1", padx=6, pady=2)
+    btn_pre_gprs.pack(side=tk.LEFT, padx=3)
+
+    btn_pre_net = tk.Button(row0, text="🔌 IP & WiFi", command=on_search_net_btn, font=("Segoe UI", 9), bg="#f1f8e9", fg="#33691e", padx=6, pady=2)
+    btn_pre_net.pack(side=tk.LEFT, padx=3)
+
+    btn_pre_solar = tk.Button(row0, text="⚡ Solar & Power", command=on_search_solar_btn, font=("Segoe UI", 9), bg="#fff8e1", fg="#e65100", padx=6, pady=2)
+    btn_pre_solar.pack(side=tk.LEFT, padx=3)
+
+    btn_pre_sys = tk.Button(row0, text="⚙️ System & CPU", command=on_search_sys_btn, font=("Segoe UI", 9), bg="#f3e5f5", fg="#4a148c", padx=6, pady=2)
+    btn_pre_sys.pack(side=tk.LEFT, padx=3)
+
+    btn_pre_all = tk.Button(row0, text="📋 Show All (300+ Regs)", command=on_show_all_btn, font=("Segoe UI", 9), bg="#eeeeee", fg="#212121", padx=6, pady=2)
+    btn_pre_all.pack(side=tk.LEFT, padx=3)
+
+    lbl_reg_count = ttk.Label(row0, text="Showing 0 registers", font=("Segoe UI", 9, "italic"))
+    lbl_reg_count.pack(side=tk.RIGHT, padx=10)
+
+    # Ondemand Dispatch Bar
+    row1 = ttk.Frame(f_filter)
+    row1.pack(fill=tk.X, pady=(6, 2))
+
+    def fetch_all_ondemand_action():
+        nonlocal active_client, is_connected
+        if not is_connected or not active_client:
+            messagebox.showwarning("Connection", "Please connect to the MQTT broker first using the 'Connect' button above.")
+            return
+
+        target_imei = broker_cfg.get("name", "866738083619898")
+        top = f"rtsg-1/ongridrooftop/{target_imei}/ondemand/sub"
+        payload = "asas"
+        active_client.publish(top, payload, qos=0)
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        lbl_fetch_feedback.config(text=f"[+] Dispatched Ondemand fetch ('{payload}') to '{top}' at {now_str}! Waiting for response...", fg="#0d47a1")
+
+    def fetch_gprs_ondemand_action():
+        on_search_gprs_btn()
+        fetch_all_ondemand_action()
+
+    def fetch_selected_register_action():
+        nonlocal active_client, is_connected
+        selected = tree_regs.selection()
+        if not selected:
+            messagebox.showinfo("Select Register", "Please select a register row from the table first.")
+            return
+        if not is_connected or not active_client:
+            messagebox.showwarning("Connection", "Please connect to the MQTT broker first using the 'Connect' button above.")
+            return
+
+        item = tree_regs.item(selected[0])
+        vals = item.get("values", [])
+        if vals:
+            reg_addr = vals[0]
+            reg_name = vals[1]
+            target_imei = broker_cfg.get("name", "866738083619898")
+            top = f"rtsg-1/ongridrooftop/{target_imei}/ondemand/sub"
+            payload = json.dumps({"reg": reg_addr}) if False else "asas"
+            active_client.publish(top, "asas", qos=0)
+            now_str = datetime.now().strftime("%H:%M:%S")
+            lbl_fetch_feedback.config(text=f"[+] Querying register {reg_addr} ({reg_name}) via '{top}' at {now_str}...", fg="#e65100")
+
+    btn_fetch_main = tk.Button(row1, text="🚀 FETCH CURRENT VALUES (ONDEMAND)", command=fetch_all_ondemand_action, font=("Segoe UI", 10, "bold"), bg="#28a745", fg="white", relief=tk.RAISED, padx=12, pady=3)
+    btn_fetch_main.pack(side=tk.LEFT, padx=(0, 6))
+
+    btn_fetch_gprs_list = tk.Button(row1, text="🌐 FETCH GPRS LIST VALUES", command=fetch_gprs_ondemand_action, font=("Segoe UI", 9, "bold"), bg="#007bff", fg="white", relief=tk.RAISED, padx=10, pady=3)
+    btn_fetch_gprs_list.pack(side=tk.LEFT, padx=4)
+
+    btn_fetch_sel = tk.Button(row1, text="⚡ Fetch Selected Register", command=fetch_selected_register_action, font=("Segoe UI", 9), bg="#ffc107", fg="#212529", relief=tk.RAISED, padx=8, pady=3)
+    btn_fetch_sel.pack(side=tk.LEFT, padx=4)
+
+    lbl_fetch_feedback = tk.Label(row1, text="Ready. Click 'FETCH CURRENT VALUES' to query device via ondemand MQTT topic.", fg="#555", font=("Segoe UI", 9))
+    lbl_fetch_feedback.pack(side=tk.LEFT, padx=10)
+
+    # Register Table Treeview
+    reg_table_frame = ttk.Frame(tab_regs)
+    reg_table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+    reg_cols = ("Address", "Register Name", "Category", "Current Value", "Description", "Last Updated")
+    tree_regs = ttk.Treeview(reg_table_frame, columns=reg_cols, show="headings", selectmode="browse")
+
+    tree_regs.heading("Address", text="Modbus Addr", anchor=tk.CENTER)
+    tree_regs.heading("Register Name", text="Register Name", anchor=tk.W)
+    tree_regs.heading("Category", text="Category", anchor=tk.CENTER)
+    tree_regs.heading("Current Value", text="Current Value (Live)", anchor=tk.CENTER)
+    tree_regs.heading("Description", text="Description / Function", anchor=tk.W)
+    tree_regs.heading("Last Updated", text="Last Updated", anchor=tk.CENTER)
+
+    tree_regs.column("Address", width=95, anchor=tk.CENTER)
+    tree_regs.column("Register Name", width=175, anchor=tk.W)
+    tree_regs.column("Category", width=130, anchor=tk.CENTER)
+    tree_regs.column("Current Value", width=140, anchor=tk.CENTER)
+    tree_regs.column("Description", width=340, anchor=tk.W)
+    tree_regs.column("Last Updated", width=115, anchor=tk.CENTER)
+
+    tree_regs.tag_configure("updated", background="#e8f5e9", foreground="#1b5e20")
+    tree_regs.tag_configure("normal", background="#ffffff")
+
+    reg_scroll_y = ttk.Scrollbar(reg_table_frame, orient=tk.VERTICAL, command=tree_regs.yview)
+    tree_regs.configure(yscrollcommand=reg_scroll_y.set)
+    tree_regs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    reg_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def apply_filter_regs(*args):
+        query = entry_reg_search.get().strip().upper()
+        cat = current_cat_filter.get()
+
+        for item in tree_regs.get_children():
+            tree_regs.delete(item)
+
+        matches = []
+        for r in REGISTER_CACHE.values():
+            if cat != "All" and r["category"] != cat:
+                continue
+            if not query:
+                matches.append(r)
+            elif (query in str(r["address"]) or 
+                  query in r["name"].upper() or 
+                  query in r["category"].upper() or 
+                  query in r.get("description", "").upper()):
+                matches.append(r)
+
+        matches.sort(key=lambda x: x["address"])
+
+        for r in matches:
+            val = r.get("value", "---")
+            ts = r.get("updated_at", "Never")
+            tag = "updated" if val != "---" else "normal"
+            tree_regs.insert("", tk.END, iid=str(r["address"]), values=(
+                r["address"],
+                r["name"],
+                r["category"],
+                val,
+                r.get("description", ""),
+                ts
+            ), tags=(tag,))
+
+        lbl_reg_count.config(text=f"Showing {len(matches)} / {len(REGISTER_CACHE)} registers")
+
+    entry_reg_search.bind("<KeyRelease>", apply_filter_regs)
+    apply_filter_regs()
+
+    def update_registers_table(data_dict, now_utc):
+        updated_count = 0
+        if not data_dict or not isinstance(data_dict, dict):
+            return 0
+
+        regs_dict = data_dict.get("registers", {})
+        if isinstance(regs_dict, dict):
+            for reg_k, reg_v in regs_dict.items():
+                try:
+                    reg_addr = int(reg_k)
+                    if reg_addr in REGISTER_CACHE:
+                        REGISTER_CACHE[reg_addr]["value"] = str(reg_v)
+                        REGISTER_CACHE[reg_addr]["updated_at"] = now_utc
+                        updated_count += 1
+                except (ValueError, TypeError):
+                    pass
+
+        for k, v in data_dict.items():
+            k_up = str(k).upper().replace("-", "_").replace(" ", "_")
+            if k_up in NAME_TO_ADDR:
+                addr = NAME_TO_ADDR[k_up]
+                REGISTER_CACHE[addr]["value"] = str(v)
+                REGISTER_CACHE[addr]["updated_at"] = now_utc
+                updated_count += 1
+
+        if "IS-1-0---VN" in data_dict and 3044 in REGISTER_CACHE:
+            REGISTER_CACHE[3044]["value"] = f"{data_dict['IS-1-0---VN']} V"
+            REGISTER_CACHE[3044]["updated_at"] = now_utc
+            updated_count += 1
+        if "IS-1-0---FREQ" in data_dict and 3052 in REGISTER_CACHE:
+            REGISTER_CACHE[3052]["value"] = f"{data_dict['IS-1-0---FREQ']} Hz"
+            REGISTER_CACHE[3052]["updated_at"] = now_utc
+            updated_count += 1
+        if "IS-1-0---POW" in data_dict and 2978 in REGISTER_CACHE:
+            REGISTER_CACHE[2978]["value"] = f"{data_dict['IS-1-0---POW']} W"
+            REGISTER_CACHE[2978]["updated_at"] = now_utc
+            updated_count += 1
+        if "CMKEY" in data_dict and 3554 in REGISTER_CACHE:
+            REGISTER_CACHE[3554]["value"] = str(data_dict["CMKEY"])
+            REGISTER_CACHE[3554]["updated_at"] = now_utc
+            updated_count += 1
+
+        apply_filter_regs()
+        if updated_count > 0:
+            lbl_fetch_feedback.config(text=f"[✓] Received device response! Updated {updated_count} register values at {now_utc} UTC", fg="green")
+        return updated_count
+
+    # -------------------------------------------------------------------------
+    # TAB 2: SEND ONDEMAND COMMAND & PACKET INSPECTOR
+    # -------------------------------------------------------------------------
+    tab2 = ttk.Frame(notebook)
+    notebook.add(tab2, text="  🚀 Send Ondemand Command  ")
+
+    t2_top = ttk.LabelFrame(tab2, text="Dispatch Command to Device", padding=12)
+    t2_top.pack(fill=tk.X, padx=10, pady=5)
+
+    ttk.Label(t2_top, text="Target IMEI:").grid(row=0, column=0, sticky=tk.W, pady=4, padx=5)
+    entry_imei_cmd = ttk.Entry(t2_top, width=22)
+    entry_imei_cmd.insert(0, broker_cfg.get("name", "866738083619898"))
+    entry_imei_cmd.grid(row=0, column=1, sticky=tk.W, pady=4, padx=5)
+
+    ttk.Label(t2_top, text="Publish Topic:").grid(row=0, column=2, sticky=tk.W, pady=4, padx=5)
+    entry_topic_cmd = ttk.Entry(t2_top, width=42)
+    entry_topic_cmd.insert(0, f"rtsg-1/ongridrooftop/{broker_cfg.get('name', '866738083619898')}/ondemand/sub")
+    entry_topic_cmd.grid(row=0, column=3, sticky=tk.W, pady=4, padx=5)
+
+    ttk.Label(t2_top, text="Payload:").grid(row=1, column=0, sticky=tk.W, pady=4, padx=5)
+    entry_payload_cmd = ttk.Entry(t2_top, width=22)
+    entry_payload_cmd.insert(0, "asas")
+    entry_payload_cmd.grid(row=1, column=1, sticky=tk.W, pady=4, padx=5)
+
+    lbl_send_status = tk.Label(t2_top, text="Ready to send.", fg="gray", font=("Segoe UI", 9))
+    lbl_send_status.grid(row=1, column=3, sticky=tk.W, padx=5)
+
+    def dispatch_ondemand():
+        nonlocal active_client, is_connected
+        if not is_connected or not active_client:
+            messagebox.showwarning("Connection", "Please connect to the MQTT broker first.")
+            return
+
+        target_top = entry_topic_cmd.get().strip()
+        payload = entry_payload_cmd.get().strip()
+        active_client.publish(target_top, payload, qos=0)
+
+        now_str = datetime.now().strftime("%H:%M:%S")
+        lbl_send_status.config(text=f"[+] Dispatched '{payload}' at {now_str}! Waiting for response...", fg="blue")
+        resp_box.delete("1.0", tk.END)
+        resp_box.insert(tk.END, f"[*] Dispatched '{payload}' to {target_top} at {now_str}...\nWaiting for device response on '.../ondemand/pub' or '.../data/pub'...\n")
+
+    btn_send_cmd = tk.Button(t2_top, text="🚀  SEND ONDEMAND REQUEST", command=dispatch_ondemand, bg="#28a745", fg="white", font=("Segoe UI", 10, "bold"), relief=tk.RAISED, padx=10, pady=4)
+    btn_send_cmd.grid(row=1, column=2, padx=10, pady=5)
+
+    # Automatic Response Viewer Frame
+    t2_resp_frame = ttk.LabelFrame(tab2, text="Live Ondemand Response Data (Auto-Updated when Received)", padding=10)
+    t2_resp_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    resp_box = scrolledtext.ScrolledText(t2_resp_frame, wrap=tk.WORD, font=("Consolas", 10), bg="#f8f9fa")
+    resp_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    resp_box.insert(tk.END, "No ondemand response received yet.\nConnect to broker and click 'SEND ONDEMAND REQUEST' above to fetch data.\n")
+
+    # -------------------------------------------------------------------------
+    # TAB 3: LIVE TELEMETRY & EXCEL LOGS
+    # -------------------------------------------------------------------------
     tab1 = ttk.Frame(notebook)
-    notebook.add(tab1, text="  Live Telemetry Monitor  ")
+    notebook.add(tab1, text="  📊 Live Telemetry Monitor  ")
 
     cols = ("Time (UTC)", "Topic", "IMEI", "Voltage (V)", "Freq (Hz)", "Power (W)", "INDEX", "CMKEY")
     tree = ttk.Treeview(tab1, columns=cols, show="headings", selectmode="browse")
@@ -876,60 +1266,11 @@ def launch_gui(initial_config=None):
     btn_clear_tree = ttk.Button(t1_btn_frame, text="Clear Table", command=clear_tree)
     btn_clear_tree.pack(side=tk.RIGHT, padx=5)
 
-    # Tab 2: Send Ondemand Command (WITH BUTTON & AUTOMATIC RESPONSE VIEWER)
-    tab2 = ttk.Frame(notebook)
-    notebook.add(tab2, text="  Send Ondemand Command  ")
-
-    t2_top = ttk.LabelFrame(tab2, text="Dispatch Command to Device", padding=12)
-    t2_top.pack(fill=tk.X, padx=10, pady=5)
-
-    ttk.Label(t2_top, text="Target IMEI:").grid(row=0, column=0, sticky=tk.W, pady=4, padx=5)
-    entry_imei_cmd = ttk.Entry(t2_top, width=22)
-    entry_imei_cmd.insert(0, "866738083619898")
-    entry_imei_cmd.grid(row=0, column=1, sticky=tk.W, pady=4, padx=5)
-
-    ttk.Label(t2_top, text="Publish Topic:").grid(row=0, column=2, sticky=tk.W, pady=4, padx=5)
-    entry_topic_cmd = ttk.Entry(t2_top, width=42)
-    entry_topic_cmd.insert(0, "rtsg-1/ongridrooftop/866738083619898/ondemand/sub")
-    entry_topic_cmd.grid(row=0, column=3, sticky=tk.W, pady=4, padx=5)
-
-    ttk.Label(t2_top, text="Payload:").grid(row=1, column=0, sticky=tk.W, pady=4, padx=5)
-    entry_payload_cmd = ttk.Entry(t2_top, width=22)
-    entry_payload_cmd.insert(0, "asas")
-    entry_payload_cmd.grid(row=1, column=1, sticky=tk.W, pady=4, padx=5)
-
-    lbl_send_status = tk.Label(t2_top, text="Ready to send.", fg="gray", font=("Segoe UI", 9))
-    lbl_send_status.grid(row=1, column=3, sticky=tk.W, padx=5)
-
-    def dispatch_ondemand():
-        nonlocal active_client, is_connected
-        if not is_connected or not active_client:
-            messagebox.showwarning("Connection", "Please connect to the MQTT broker first.")
-            return
-
-        target_top = entry_topic_cmd.get().strip()
-        payload = entry_payload_cmd.get().strip()
-        active_client.publish(target_top, payload, qos=0)
-
-        now_str = datetime.now().strftime("%H:%M:%S")
-        lbl_send_status.config(text=f"[+] Dispatched '{payload}' at {now_str}! Waiting for response...", fg="blue")
-        resp_box.delete("1.0", tk.END)
-        resp_box.insert(tk.END, f"[*] Dispatched '{payload}' to {target_top} at {now_str}...\nWaiting for device response on '.../ondemand/pub'...\n")
-
-    btn_send_cmd = tk.Button(t2_top, text="🚀  SEND ONDEMAND REQUEST", command=dispatch_ondemand, bg="#28a745", fg="white", font=("Segoe UI", 10, "bold"), relief=tk.RAISED, padx=10, pady=4)
-    btn_send_cmd.grid(row=1, column=2, padx=10, pady=5)
-
-    # Automatic Response Viewer Frame
-    t2_resp_frame = ttk.LabelFrame(tab2, text="Live Ondemand Response Data (Auto-Updated when Received)", padding=10)
-    t2_resp_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-    resp_box = scrolledtext.ScrolledText(t2_resp_frame, wrap=tk.WORD, font=("Consolas", 10), bg="#f8f9fa")
-    resp_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    resp_box.insert(tk.END, "No ondemand response received yet.\nConnect to broker and click 'SEND ONDEMAND REQUEST' above to fetch data.\n")
-
-    # Tab 3: Console Logs
+    # -------------------------------------------------------------------------
+    # TAB 4: CONSOLE LOGS
+    # -------------------------------------------------------------------------
     tab3 = ttk.Frame(notebook)
-    notebook.add(tab3, text="  Live Console Logs  ")
+    notebook.add(tab3, text="  📝 Live Console Logs  ")
 
     log_box = scrolledtext.ScrolledText(tab3, wrap=tk.WORD, font=("Consolas", 9))
     log_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -940,15 +1281,16 @@ def launch_gui(initial_config=None):
 
     def on_gui_message(topic, payload_str, data_dict, is_rtevent):
         now_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        log_to_console(f"[{now_utc}] {topic} -> {payload_str}")
 
-        if not is_rtevent:
-            log_to_console(f"[{now_utc}] {topic} -> {payload_str}")
+        # Update Register Table with live values
+        if data_dict:
+            root.after(0, lambda: update_registers_table(data_dict, now_utc))
 
-        if "ondemand" in topic.lower():
-            # Update the ondemand response viewer
+        if "ondemand" in topic.lower() or "data" in topic.lower():
             root.after(0, lambda: update_ondemand_viewer(topic, payload_str, data_dict, now_utc))
 
-        if data_dict and not is_rtevent:
+        if data_dict:
             imei = data_dict.get("IMEI", "")
             vn = data_dict.get("IS-1-0---VN", "")
             freq = data_dict.get("IS-1-0---FREQ", "")
@@ -1039,7 +1381,6 @@ def open_config_files_cmd_list():
                 if f not in found_files and not f.startswith("~"):
                     found_files.append(f)
 
-        # Sort with primary configs first
         primary = ["config.yaml", "config.xml", "server_credentials.json", "connection_history.json"]
         found_files.sort(key=lambda x: (0 if x in primary else 1, x.lower()))
 
@@ -1081,7 +1422,6 @@ def open_config_files_cmd_list():
 
         parts = cmd.split()
         if len(parts) == 1 and parts[0].isdigit():
-            # Run file
             sel_num = int(parts[0]) - 1
             if 0 <= sel_num < len(found_files):
                 target_f = found_files[sel_num]
@@ -1091,7 +1431,6 @@ def open_config_files_cmd_list():
             else:
                 print("[!] Invalid file number.")
         elif len(parts) == 2 and parts[0].upper() == "V" and parts[1].isdigit():
-            # View file
             sel_num = int(parts[1]) - 1
             if 0 <= sel_num < len(found_files):
                 target_f = found_files[sel_num]
@@ -1102,7 +1441,6 @@ def open_config_files_cmd_list():
             else:
                 print("[!] Invalid file number.")
         elif len(parts) == 2 and parts[0].upper() == "O" and parts[1].isdigit():
-            # Open file
             sel_num = int(parts[1]) - 1
             if 0 <= sel_num < len(found_files):
                 target_f = found_files[sel_num]
@@ -1165,7 +1503,7 @@ def enter_new_imei_action():
     dev_name = input(f"Enter Device Name (default: Unit-{new_imei}): ").strip() or f"Unit-{new_imei}"
 
     new_cfg = json.loads(json.dumps(base_cfg))
-    new_cfg["topics"] = generate_single_imei_topics(new_imei, include_rtevent=False)
+    new_cfg["topics"] = generate_single_imei_topics(new_imei)
     new_cfg["registered_devices"] = [
         {
             "imei": new_imei,
@@ -1222,32 +1560,7 @@ def enter_new_connection_action():
     if password:
         save_server_credential(host, username, password, port, client_id)
 
-    print("\n" + "-" * 80)
-    print("TOPIC CONFIGURATION METHOD:")
-    print("  [1] Auto-generate single IMEI topics (no wildcards)")
-    print("  [2] Paste custom list of topics")
-    print("-" * 80)
-
-    t_choice = input("Select option (1 or 2, default: 1): ").strip()
-    if t_choice != "2":
-        topics_cfg = generate_single_imei_topics(imei, include_rtevent=False)
-    else:
-        print("\nPaste your topics below (empty line to finish):")
-        pasted = []
-        while True:
-            try:
-                line = input()
-            except EOFError:
-                break
-            if not line:
-                break
-            for p in line.replace(",", "\n").replace(";", "\n").split("\n"):
-                if p.strip() and p.strip() not in pasted:
-                    pasted.append(p.strip())
-        topics_cfg = {
-            "ondemand_sub_template": pasted[0] if pasted else f"rtsg-1/ongridrooftop/{imei}/ondemand/sub",
-            "info_subscriptions": pasted or generate_single_imei_topics(imei, include_rtevent=False)["info_subscriptions"]
-        }
+    topics_cfg = generate_single_imei_topics(imei)
 
     new_cfg = {
         "broker": {
@@ -1272,8 +1585,7 @@ def enter_new_connection_action():
             "response_timeout_seconds": 30,
             "payload_to_send": "asas",
             "target_imei_only": True,
-            "skip_rtevent_console": True,
-            "subscribe_rtevent": False
+            "rtevent_display_mode": "compact"
         },
         "registered_devices": [
             {
@@ -1339,26 +1651,91 @@ def run_simulator(config):
     print("=" * 80)
 
 
+def search_and_fetch_gprs_cli():
+    """Searches Modbus registers or GPRS list and allows ondemand fetching in CLI."""
+    while True:
+        print("\n" + "=" * 80)
+        print("      MODBUS & GPRS CONNECTION REGISTER EXPLORER (CLI ONDEMAND)")
+        print("=" * 80)
+        print("\nPlease select an action:\n")
+        print("  [1] List All GPRS & Cellular Connection Registers (APN, IP, Port, RSSI, Status)")
+        print("  [2] Search Registers by Name or Address Keyword (e.g. 'GPRS', 'PORT', 'VOLT')")
+        print("  [3] Show All 300+ Modbus / SCADA Registers")
+        print("  [4] Fetch Live Current Values from Device (Ondemand Query)")
+        print("  [5] Back to Main Menu\n")
+        print("-" * 80)
+
+        sub_ch = input("Enter choice (1-5): ").strip()
+        if sub_ch == "1":
+            gprs_regs = [r for r in ALL_REGISTERS if r.get("category") in ["GPRS & Network", "IP & WiFi Config", "SSL & Security"]]
+            print(f"\nFound {len(gprs_regs)} GPRS / Connection Register(s):")
+            print("-" * 80)
+            print(f" {'Addr':<6} {'Register Name':<24} {'Category':<16} {'Description'}")
+            print("-" * 80)
+            for r in gprs_regs:
+                print(f" {r['address']:<6} {r['name']:<24} {r['category']:<16} {r.get('description', '')}")
+            print("-" * 80)
+
+            fetch_now = input("\nDispatch ondemand fetch to query these values from the device right now? (Y/n): ").strip().lower()
+            if fetch_now in ["", "y", "yes"]:
+                cfg = load_config_file("config.yaml") if os.path.exists("config.yaml") else DEFAULT_CONFIG
+                run_live_client(cfg, once=True)
+
+        elif sub_ch == "2":
+            kw = input("Enter search keyword (e.g. 'GPRS', 'IP', 'SIM', '3354'): ").strip()
+            results = search_registers(kw)
+            print(f"\nFound {len(results)} matching register(s) for '{kw}':")
+            print("-" * 80)
+            print(f" {'Addr':<6} {'Register Name':<24} {'Category':<16} {'Description'}")
+            print("-" * 80)
+            for r in results:
+                print(f" {r['address']:<6} {r['name']:<24} {r['category']:<16} {r.get('description', '')}")
+            print("-" * 80)
+
+            fetch_now = input("\nDispatch ondemand fetch to query values from device? (Y/n): ").strip().lower()
+            if fetch_now in ["", "y", "yes"]:
+                cfg = load_config_file("config.yaml") if os.path.exists("config.yaml") else DEFAULT_CONFIG
+                run_live_client(cfg, once=True)
+
+        elif sub_ch == "3":
+            print(f"\nTotal Modbus Registers: {len(ALL_REGISTERS)}")
+            print("-" * 80)
+            print(f" {'Addr':<6} {'Register Name':<24} {'Category':<16} {'Description'}")
+            print("-" * 80)
+            for r in ALL_REGISTERS:
+                print(f" {r['address']:<6} {r['name']:<24} {r['category']:<16} {r.get('description', '')}")
+            print("-" * 80)
+
+        elif sub_ch == "4":
+            cfg = load_config_file("config.yaml") if os.path.exists("config.yaml") else DEFAULT_CONFIG
+            print("\nDispatching live Ondemand Query ('asas') to device ondemand/sub topic...")
+            run_live_client(cfg, once=True)
+
+        elif sub_ch == "5":
+            break
+
+
 def main_menu():
     global DEFAULT_CONFIG
     while True:
-        silence_status = "ENABLED (Silenced)" if DEFAULT_CONFIG["settings"].get("skip_rtevent_console", True) else "DISABLED (Printing)"
+        curr_mode = DEFAULT_CONFIG["settings"].get("rtevent_display_mode", "compact").upper()
         print("\n" + "=" * 80)
         print("              MQTT SCADA & RTEVENT CONTROLLER - MAIN MENU")
         print("=" * 80)
         print("\nPlease select an Option:\n")
-        print("  [1] Launch Tkinter Graphical UI (GUI with Send Ondemand Button & Viewer)")
+        print("  [1] Launch Tkinter Graphical UI (Modbus & GPRS Register Explorer, Ondemand, Telemetry)")
         print("  [2] Select the previous connection")
-        print("  [3] Enter new IEMI / IMEI (Single Device Mode)")
-        print("  [4] Enter new connection")
-        print("  [5] Configuration Files List (Open/View/Run config.yaml, config.xml, json...)")
-        print(f"  [6] Toggle Silence 'rtevent' from Console (Currently: {silence_status})")
-        print("  [7] Open Excel / CSV RTEvent Log File")
-        print("  [8] Offline Simulator Mode       (Test without connecting to live broker)")
-        print("  [9] Exit\n")
+        print("  [3] Search & Fetch Modbus / GPRS Registers (CLI Ondemand Query)")
+        print("  [4] Enter new IEMI / IMEI (Single Device Mode)")
+        print("  [5] Enter new connection")
+        print("  [6] Configuration Files List (Open/View/Run config.yaml, config.xml, json...)")
+        print(f"  [7] Toggle Telemetry Display Mode (Currently: {curr_mode})")
+        print("  [8] Open Excel / CSV RTEvent Log File")
+        print("  [9] Offline Simulator Mode       (Test without connecting to live broker)")
+        print("  [10] Exit\n")
         print("-" * 80)
 
-        choice = input("Enter your choice (1-9): ").strip()
+        choice = input("Enter your choice (1-10): ").strip()
 
         if choice == "1":
             launch_gui()
@@ -1367,32 +1744,37 @@ def main_menu():
             select_previous_connection_action()
 
         elif choice == "3":
-            enter_new_imei_action()
+            search_and_fetch_gprs_cli()
 
         elif choice == "4":
-            enter_new_connection_action()
+            enter_new_imei_action()
 
         elif choice == "5":
-            open_config_files_cmd_list()
+            enter_new_connection_action()
 
         elif choice == "6":
-            curr = DEFAULT_CONFIG["settings"].get("skip_rtevent_console", True)
-            DEFAULT_CONFIG["settings"]["skip_rtevent_console"] = not curr
-            new_st = "SILENCED (Clean Console)" if not curr else "PRINTING TO CONSOLE"
-            print(f"\n[+] 'rtevent' console display is now: {new_st}")
+            open_config_files_cmd_list()
 
         elif choice == "7":
+            curr = DEFAULT_CONFIG["settings"].get("rtevent_display_mode", "compact")
+            modes = ["compact", "full", "silent"]
+            next_idx = (modes.index(curr) + 1) % len(modes)
+            new_mode = modes[next_idx]
+            DEFAULT_CONFIG["settings"]["rtevent_display_mode"] = new_mode
+            print(f"\n[+] Telemetry display mode is now: {new_mode.upper()}")
+
+        elif choice == "8":
             if os.path.exists(RTEVENT_CSV_LOG):
                 print(f"Opening '{RTEVENT_CSV_LOG}'...")
                 os.system(f'start "" "{RTEVENT_CSV_LOG}"')
             else:
                 print(f"[!] Log file '{RTEVENT_CSV_LOG}' does not exist yet.")
 
-        elif choice == "8":
+        elif choice == "9":
             cfg = load_config_file("config.yaml") if os.path.exists("config.yaml") else DEFAULT_CONFIG
             run_simulator(cfg)
 
-        elif choice == "9":
+        elif choice in ["10", "q", "exit"]:
             print("\nExiting. Goodbye!")
             sys.exit(0)
 
