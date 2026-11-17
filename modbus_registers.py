@@ -1150,26 +1150,43 @@ RAW_DEFINES_TEXT = """
 #define STRING_START_ADDRESS_2 6286
 """
 
+from datetime import datetime
+import random
+
+SECTIONS = [
+    "1. GPRS_Connection",
+    "2. SPIFFS_Storage",
+    "3. Restart_Count",
+    "4. Solar_Power",
+    "5. Meters_DLMS",
+    "6. Control_Relays",
+    "7. System_RTC",
+    "8. All_Registers"
+]
+
 def categorize_register(name, addr):
     n = name.upper()
-    if any(k in n for k in ["GPRS", "MODEM", "SIM", "NET_", "NETS", "APN", "PORT", "MODULE", "USER", "PASSWORD", "RSSI", "BROKER", "CID", "SERVER", "MQTT", "GSM", "COMM"]):
-        return "GPRS & Network"
-    elif any(k in n for k in ["WIFI", "L_IP", "L_MASK", "L_GATE", "L_DNS", "DHCP", "IP1", "IP2", "IP3", "IP4"]):
-        return "IP & WiFi Config"
-    elif any(k in n for k in ["SSL", "CERT", "FILE_CA", "FILE_CC", "FILE_CK", "FILE_UUID"]):
-        return "SSL & Security"
-    elif any(k in n for k in ["METER", "DLMS", "BILL", "TAMPER", "LS_TOD", "LS_AUTO", "LOAD_UPLOAD"]):
-        return "Meters & DLMS"
-    elif any(k in n for k in ["SOLAR", "GRID", "VOLT", "CURR", "POW", "FREQ", "PHASE", "PUMP", "INV", "INVERTER", "UNBALANCE", "R_V", "Y_V", "B_V", "R_I", "Y_I", "B_I", "VD28", "IS_1_0"]):
-        return "Solar & Power"
-    elif any(k in n for k in ["AI1", "AI2", "AI3", "AI4", "AI5", "AI6", "AIOFFSET", "ANALOG"]):
-        return "Analog Channels"
-    elif any(k in n for k in ["DO", "READDO", "DOMODE", "DEVICE_ON", "DEVICE_OFF", "SWITCH", "RELAY", "CONTACTOR", "FAULT", "TRIP", "CUTOFF"]):
-        return "Control & Relays"
-    elif any(k in n for k in ["RTC", "TIME", "DATE", "EPOCH", "FIRMWARE", "FW_", "SYS_", "WATCHDOG", "RESET", "TEMP", "SD_", "EEPROM", "SPIFFS", "BATTERY", "MILLIS", "SLAVEID", "MSG_ID"]):
-        return "System & Diagnostics"
+    # 2. SPIFFS & Storage
+    if any(k in n for k in ["SPIFF", "SD_", "EEPROM", "STORAGE", "FLASH", "NVS", "SET_FILENAME", "FR_STORE", "FR_WRITE"]):
+        return "2. SPIFFS_Storage"
+    # 3. Restart, Resets & Watchdog Counters
+    elif any(k in n for k in ["RESTART", "RESET", "WATCHDOG", "WD_", "RETRY", "TRIP", "POFFCNT", "SLOT_CHANGE", "APPLYRESET"]):
+        return "3. Restart_Count"
+    # 1. GPRS & Network Connection
+    elif any(k in n for k in ["GPRS", "MODEM", "SIM", "NET_", "NETS", "APN", "PORT", "MODULE", "USER", "PASSWORD", "RSSI", "BROKER", "CID", "SERVER", "MQTT", "GSM", "COMM", "WIFI", "IP1", "IP2", "IP3", "IP4", "L_IP", "L_MASK", "L_GATE", "L_DNS", "DHCP", "SSL", "CERT"]):
+        return "1. GPRS_Connection"
+    # 4. Solar, Grid & Power
+    elif any(k in n for k in ["SOLAR", "GRID", "VOLT", "CURR", "POW", "FREQ", "PHASE", "PUMP", "INV", "INVERTER", "VD28", "UNBALANCE", "R_V", "Y_V", "B_V", "R_I", "Y_I", "B_I", "IS_1_0", "POWER_230", "POWER_24", "POWER_BATTERY"]):
+        return "4. Solar_Power"
+    # 5. Smart Meters & DLMS
+    elif any(k in n for k in ["METER", "DLMS", "BILL", "TAMPER", "LS_TOD", "LS_AUTO", "LOAD_UPLOAD", "BL_AUTO", "BL_"]):
+        return "5. Meters_DLMS"
+    # 6. Control & Relays
+    elif any(k in n for k in ["DO", "READDO", "DOMODE", "DEVICE_ON", "DEVICE_OFF", "SWITCH", "RELAY", "CONTACTOR", "FAULT", "CUTOFF", "CMD"]):
+        return "6. Control_Relays"
+    # 7. System, RTC & CPU
     else:
-        return "General Registers"
+        return "7. System_RTC"
 
 DESCRIPTIONS = {
     "GPRS_S": "GPRS Attachment Status (0=Detached, 1=Attached & Active)",
@@ -1270,17 +1287,50 @@ def parse_modbus_defines():
 
 ALL_REGISTERS = parse_modbus_defines()
 
-def get_gprs_registers():
-    return [r for r in ALL_REGISTERS if r["category"] in ["GPRS & Network", "IP & WiFi Config", "SSL & Security"]]
+def get_registers_by_section(section_name):
+    """Filters registers by one of the defined sections or returns all."""
+    if section_name.startswith("8") or "ALL" in section_name.upper():
+        return list(ALL_REGISTERS)
+    return [r for r in ALL_REGISTERS if r["category"] == section_name]
 
-def search_registers(query="", category_filter="All"):
+def get_gprs_registers():
+    return [r for r in ALL_REGISTERS if r["category"] == "1. GPRS_Connection"]
+
+def search_registers(query="", section="8. All_Registers"):
     q = query.strip().upper()
     results = []
     for r in ALL_REGISTERS:
-        if category_filter != "All" and r["category"] != category_filter:
+        if not section.startswith("8") and "ALL" not in section.upper() and r["category"] != section:
             continue
         if not q:
             results.append(r)
-        elif q in str(r["address"]) or q in r["name"].upper() or q in r["category"].upper():
+        elif (q in str(r["address"]) or 
+              q in r["name"].upper() or 
+              q in r["category"].upper() or 
+              q in r.get("description", "").upper()):
             results.append(r)
     return results
+
+def build_ondemand_payload(reg_name, reg_val, cmkey="155521", pmkey="438266", cmd="read", custom_timestamp=None):
+    """
+    Constructs the exact requested JSON ondemand payload:
+    {"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","timestamp":"2026-09-07 13:35:32","type":"ondemand","cmd":"read","MODBUS_REG_NAME":VALUE_REG_GIVEN_BY_REG}
+    """
+    msgid = str(random.randint(1000000, 9999999))
+    now_ts = custom_timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Format value: integer if digits, else string or raw
+    val = reg_val
+    if isinstance(reg_val, str) and reg_val.isdigit():
+        val = int(reg_val)
+
+    payload = {
+        "msgid": str(msgid),
+        "CMKEY": str(cmkey if cmkey else "155521"),
+        "PMKEY": str(pmkey if pmkey else "438266"),
+        "timestamp": now_ts,
+        "type": "ondemand",
+        "cmd": str(cmd or "read"),
+        str(reg_name): val
+    }
+    return payload

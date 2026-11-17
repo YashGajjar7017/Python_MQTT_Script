@@ -7,21 +7,34 @@ A Python MQTT controller and telemetry processor featuring single-IMEI targeting
 ## Key Updates & Features
 
 ### 1. 🔌 Modbus & GPRS Register Explorer (GUI Tab 1)
-- Built-in database of all 300+ Modbus / SCADA registers from the device firmware defines.
-- **Instant Search & Filters**:
-  - Live search as you type (e.g. `GPRS`, `IP`, `PORT`, `APN`, `SIM`, `RSSI`, or register addresses like `3354`).
-  - Quick-preset buttons:
-    - **`🌐 Show GPRS List`**: Instantly isolates all cellular, APN, IP, port, and network status registers.
-    - **`🔌 IP & WiFi`**: Displays local IP, subnet mask, gateway, DNS, and WiFi configurations.
-    - **`⚡ Solar & Power`**: Voltage, current, power thresholds, inverter metrics, and grid supply.
-    - **`⚙️ System & CPU`**: Firmware version, RTC clock, watchdog, CPU status, and reset flags.
-    - **`📋 Show All`**: View all 300+ Modbus registers with addresses and descriptions.
-- **Ondemand Live Fetch Actions**:
-  - **`🚀 FETCH CURRENT VALUES (ONDEMAND)`**: Publishes ondemand fetch (`asas`) to `rtsg-1/ongridrooftop/{imei}/ondemand/sub`.
-  - **`🌐 FETCH GPRS LIST VALUES`**: Isolates GPRS registers and immediately queries the device.
-  - **`⚡ Fetch Selected Register`**: Queries the device specifically for the highlighted register row.
-- **Automatic Real-Time Value Updates**:
-  - When the device responds on `.../ondemand/pub`, `.../data/pub`, or `.../rtevent/pub`, incoming values in `registers` or top-level keys are **automatically mapped** into the **"Current Value"** column and **highlighted in green** with live timestamp.
+- Built-in database of all 300+ Modbus / SCADA registers partitioned into direct sections:
+  1. **`1. GPRS_Connection`**: All cellular, APN, server IP/port, signal RSSI, and modem communication registers.
+  2. **`2. SPIFFS_Storage`**: SPIFFS flash memory, SD card, EEPROM, and storage error registers.
+  3. **`3. Restart_Count`**: Watchdog reboots, modem resets, MCU resets, tripping counters, and retry registers.
+  4. **`4. Solar_Power`**: Grid AC status, voltages, currents, power thresholds, inverter VD, and frequency.
+  5. **`5. Meters_DLMS`**: Smart meters, DLMS billing counters, load surveys, and tamper event profiles.
+  6. **`6. Control_Relays`**: Digital output commands, contactors, relays, and switches.
+  7. **`7. System_RTC`**: Real-time clock (RTC), firmware version, CPU millis, GPS coordinates, and board temperature.
+  8. **`8. All_Registers`**: Full searchable catalogue of all 300+ Modbus registers.
+
+### 2. 📡 Dynamic Ondemand Device Command Dispatcher
+- **Targeted Dynamic SCADA Payload**:
+  Constructs and dispatches the exact required JSON structure:
+  ```json
+  {
+    "msgid": "6374196",
+    "CMKEY": "155521",
+    "PMKEY": "438266",
+    "timestamp": "2026-09-07 13:35:32",
+    "type": "ondemand",
+    "cmd": "read",
+    "MODBUS_REG_NAME": VALUE_REG_GIVEN_BY_REG
+  }
+  ```
+- **One-Click Table Selection**:
+  Clicking any register row in the table automatically fills `MODBUS_REG_NAME` (e.g. `GPRS_S`) and `VALUE_REG` (e.g. `3354`), updates the live preview, and clicking **`🚀 IMMEDIATELY FETCH REMOTE DEVICE (ONDEMAND)`** publishes the request directly over MQTT!
+- **Auto-Synced Handshake Keys**:
+  `CMKEY` and `PMKEY` automatically synchronize with the active session keys whenever the device connects.
 
 ### 2. Single IMEI Subscription (No Server-Wide Wildcards)
 - Subscribes strictly to the **target IMEI** (e.g. `rtsg-1/ongridrooftop/866738083619898/#`).

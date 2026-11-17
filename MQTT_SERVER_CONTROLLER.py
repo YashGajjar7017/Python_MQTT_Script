@@ -41,11 +41,36 @@ except ImportError:
     HAS_PAHO = False
 
 try:
-    from modbus_registers import ALL_REGISTERS, search_registers, get_gprs_registers
+    from modbus_registers import (
+        ALL_REGISTERS,
+        SECTIONS,
+        search_registers,
+        get_gprs_registers,
+        get_registers_by_section,
+        build_ondemand_payload
+    )
 except ImportError:
     ALL_REGISTERS = []
-    search_registers = lambda q="", c="All": []
+    SECTIONS = [
+        "1. GPRS_Connection",
+        "2. SPIFFS_Storage",
+        "3. Restart_Count",
+        "4. Solar_Power",
+        "5. Meters_DLMS",
+        "6. Control_Relays",
+        "7. System_RTC",
+        "8. All_Registers"
+    ]
+    search_registers = lambda q="", s="8. All_Registers": []
     get_gprs_registers = lambda: []
+    get_registers_by_section = lambda s: []
+    build_ondemand_payload = lambda n, v, c="155521", p="438266", cmd="read": {}
+
+# Live Handshake Keys captured from device
+LIVE_KEYS = {
+    "CMKEY": "155521",
+    "PMKEY": "438266"
+}
 
 # File Paths
 CREDENTIALS_FILE = "server_credentials.json"
@@ -710,8 +735,14 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
             print("\n" + "=" * 80)
             print(f"[DEVICE MESSAGEKEY RECEIVED] Topic: {topic}")
             if parsed_dict:
-                print(f"  CMKEY    : {parsed_dict.get('CMKEY')}")
-                print(f"  PMKEY    : {parsed_dict.get('PMKEY')}")
+                cm = str(parsed_dict.get("CMKEY", "") or "")
+                pm = str(parsed_dict.get("PMKEY", "") or "")
+                if cm:
+                    LIVE_KEYS["CMKEY"] = cm
+                if pm:
+                    LIVE_KEYS["PMKEY"] = pm
+                print(f"  CMKEY    : {cm or parsed_dict.get('CMKEY')}")
+                print(f"  PMKEY    : {pm or parsed_dict.get('PMKEY')}")
                 print(f"  Timestamp: {parsed_dict.get('timestamp')}")
             else:
                 print(f"  Payload  : {payload_str}")
@@ -927,154 +958,256 @@ def launch_gui(initial_config=None):
     btn_connect.grid(row=0, column=9, padx=5)
 
     # =========================================================================
-    # REGISTER DATA CACHE & MAPPER
+    # REGISTER DATA CACHE, SECTIONS & MAPPER
     # =========================================================================
     REGISTER_CACHE = {r["address"]: dict(r) for r in ALL_REGISTERS}
     NAME_TO_ADDR = {r["name"].upper(): r["address"] for r in ALL_REGISTERS}
-    current_cat_filter = tk.StringVar(value="All")
+    current_section = tk.StringVar(value="1. GPRS_Connection")
 
     # Notebook Tabs
     notebook = ttk.Notebook(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
     # -------------------------------------------------------------------------
-    # TAB 1: MODBUS & GPRS REGISTER EXPLORER (SEARCH, FILTER & ONDEMAND FETCH)
+    # TAB 1: MODBUS & GPRS REGISTER EXPLORER (SECTIONS & DYNAMIC ONDEMAND FETCH)
     # -------------------------------------------------------------------------
     tab_regs = ttk.Frame(notebook)
     notebook.add(tab_regs, text="  🔌 Modbus & GPRS Register Explorer  ")
 
-    # Search and Filter Toolbar
-    f_filter = ttk.LabelFrame(tab_regs, text="Search & Filter Connection Registers (GPRS, Network, Modbus)", padding=8)
-    f_filter.pack(fill=tk.X, padx=10, pady=4)
+    # Section 1 Header: Direct Partition Selector
+    f_sections = ttk.LabelFrame(tab_regs, text="1. Select Modbus Register Section / Partition", padding=6)
+    f_sections.pack(fill=tk.X, padx=10, pady=3)
 
-    row0 = ttk.Frame(f_filter)
-    row0.pack(fill=tk.X, pady=2)
+    sec_btn_frame = ttk.Frame(f_sections)
+    sec_btn_frame.pack(fill=tk.X, pady=2)
 
-    ttk.Label(row0, text="🔍 Search / Filter:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(2, 6))
-    entry_reg_search = ttk.Entry(row0, width=24, font=("Segoe UI", 9))
-    entry_reg_search.insert(0, "GPRS")
+    section_colors = {
+        "1. GPRS_Connection": ("#e3f2fd", "#0d47a1"),
+        "2. SPIFFS_Storage": ("#ffe0b2", "#e65100"),
+        "3. Restart_Count": ("#ede7f6", "#4a148c"),
+        "4. Solar_Power": ("#fff8e1", "#f57f17"),
+        "5. Meters_DLMS": ("#e8f5e9", "#1b5e20"),
+        "6. Control_Relays": ("#ffebee", "#b71c1c"),
+        "7. System_RTC": ("#e0f2f1", "#004d40"),
+        "8. All_Registers": ("#f5f5f5", "#212121"),
+    }
+
+    sec_buttons = {}
+
+    def switch_section(sec_name):
+        current_section.set(sec_name)
+        for name, btn in sec_buttons.items():
+            if name == sec_name:
+                btn.config(relief=tk.SUNKEN, font=("Segoe UI", 9, "bold"), bd=3)
+            else:
+                btn.config(relief=tk.RAISED, font=("Segoe UI", 9), bd=1)
+        apply_filter_regs()
+
+    for sec in SECTIONS:
+        bg_col, fg_col = section_colors.get(sec, ("#f5f5f5", "#333"))
+        b = tk.Button(
+            sec_btn_frame,
+            text=sec,
+            command=lambda s=sec: switch_section(s),
+            bg=bg_col,
+            fg=fg_col,
+            font=("Segoe UI", 9, "bold" if sec == "1. GPRS_Connection" else "normal"),
+            relief=tk.SUNKEN if sec == "1. GPRS_Connection" else tk.RAISED,
+            bd=3 if sec == "1. GPRS_Connection" else 1,
+            padx=6,
+            pady=3
+        )
+        b.pack(side=tk.LEFT, padx=3, pady=2)
+        sec_buttons[sec] = b
+
+    # Search & Filter Toolbar
+    f_search = ttk.Frame(f_sections)
+    f_search.pack(fill=tk.X, pady=(4, 2))
+
+    ttk.Label(f_search, text="🔍 Search within Section / All:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(2, 6))
+    entry_reg_search = ttk.Entry(f_search, width=28, font=("Segoe UI", 9))
     entry_reg_search.pack(side=tk.LEFT, padx=4)
 
-    def on_search_gprs_btn():
+    def clear_search():
         entry_reg_search.delete(0, tk.END)
-        entry_reg_search.insert(0, "GPRS")
-        current_cat_filter.set("All")
         apply_filter_regs()
 
-    def on_search_net_btn():
-        entry_reg_search.delete(0, tk.END)
-        entry_reg_search.insert(0, "IP")
-        current_cat_filter.set("All")
-        apply_filter_regs()
+    btn_clear_s = ttk.Button(f_search, text="Clear Search", command=clear_search)
+    btn_clear_s.pack(side=tk.LEFT, padx=4)
 
-    def on_search_solar_btn():
-        entry_reg_search.delete(0, tk.END)
-        entry_reg_search.insert(0, "VOLT")
-        current_cat_filter.set("All")
-        apply_filter_regs()
-
-    def on_search_sys_btn():
-        entry_reg_search.delete(0, tk.END)
-        entry_reg_search.insert(0, "SYS")
-        current_cat_filter.set("All")
-        apply_filter_regs()
-
-    def on_show_all_btn():
-        entry_reg_search.delete(0, tk.END)
-        current_cat_filter.set("All")
-        apply_filter_regs()
-
-    btn_pre_gprs = tk.Button(row0, text="🌐 Show GPRS List", command=on_search_gprs_btn, font=("Segoe UI", 9, "bold"), bg="#e3f2fd", fg="#0d47a1", padx=6, pady=2)
-    btn_pre_gprs.pack(side=tk.LEFT, padx=3)
-
-    btn_pre_net = tk.Button(row0, text="🔌 IP & WiFi", command=on_search_net_btn, font=("Segoe UI", 9), bg="#f1f8e9", fg="#33691e", padx=6, pady=2)
-    btn_pre_net.pack(side=tk.LEFT, padx=3)
-
-    btn_pre_solar = tk.Button(row0, text="⚡ Solar & Power", command=on_search_solar_btn, font=("Segoe UI", 9), bg="#fff8e1", fg="#e65100", padx=6, pady=2)
-    btn_pre_solar.pack(side=tk.LEFT, padx=3)
-
-    btn_pre_sys = tk.Button(row0, text="⚙️ System & CPU", command=on_search_sys_btn, font=("Segoe UI", 9), bg="#f3e5f5", fg="#4a148c", padx=6, pady=2)
-    btn_pre_sys.pack(side=tk.LEFT, padx=3)
-
-    btn_pre_all = tk.Button(row0, text="📋 Show All (300+ Regs)", command=on_show_all_btn, font=("Segoe UI", 9), bg="#eeeeee", fg="#212121", padx=6, pady=2)
-    btn_pre_all.pack(side=tk.LEFT, padx=3)
-
-    lbl_reg_count = ttk.Label(row0, text="Showing 0 registers", font=("Segoe UI", 9, "italic"))
+    lbl_reg_count = ttk.Label(f_search, text="Showing 0 registers", font=("Segoe UI", 9, "italic"))
     lbl_reg_count.pack(side=tk.RIGHT, padx=10)
 
-    # Ondemand Dispatch Bar
-    row1 = ttk.Frame(f_filter)
-    row1.pack(fill=tk.X, pady=(6, 2))
+    # -------------------------------------------------------------------------
+    # DYNAMIC ONDEMAND PAYLOAD BUILDER & IMMEDIATE FETCH TOOLBAR
+    # -------------------------------------------------------------------------
+    f_payload = ttk.LabelFrame(tab_regs, text="2. Dynamic Ondemand Device Command (Exact SCADA JSON Dispatcher)", padding=8)
+    f_payload.pack(fill=tk.X, padx=10, pady=3)
 
-    def fetch_all_ondemand_action():
+    p_row1 = ttk.Frame(f_payload)
+    p_row1.pack(fill=tk.X, pady=2)
+
+    ttk.Label(p_row1, text="Target IMEI:").pack(side=tk.LEFT, padx=3)
+    entry_imei_dyn = ttk.Entry(p_row1, width=17)
+    entry_imei_dyn.insert(0, broker_cfg.get("name", "866738083619898"))
+    entry_imei_dyn.pack(side=tk.LEFT, padx=3)
+
+    ttk.Label(p_row1, text="MODBUS_REG_NAME:").pack(side=tk.LEFT, padx=(8, 3))
+    entry_reg_name_dyn = ttk.Entry(p_row1, width=18, font=("Consolas", 9, "bold"))
+    entry_reg_name_dyn.insert(0, "GPRS_S")
+    entry_reg_name_dyn.pack(side=tk.LEFT, padx=3)
+
+    ttk.Label(p_row1, text="VALUE_REG:").pack(side=tk.LEFT, padx=(8, 3))
+    entry_reg_val_dyn = ttk.Entry(p_row1, width=8, font=("Consolas", 9, "bold"))
+    entry_reg_val_dyn.insert(0, "3354")
+    entry_reg_val_dyn.pack(side=tk.LEFT, padx=3)
+
+    ttk.Label(p_row1, text="CMKEY:").pack(side=tk.LEFT, padx=(8, 3))
+    entry_cmkey_dyn = ttk.Entry(p_row1, width=9, font=("Consolas", 9))
+    entry_cmkey_dyn.insert(0, LIVE_KEYS.get("CMKEY", "155521"))
+    entry_cmkey_dyn.pack(side=tk.LEFT, padx=3)
+
+    ttk.Label(p_row1, text="PMKEY:").pack(side=tk.LEFT, padx=(8, 3))
+    entry_pmkey_dyn = ttk.Entry(p_row1, width=9, font=("Consolas", 9))
+    entry_pmkey_dyn.insert(0, LIVE_KEYS.get("PMKEY", "438266"))
+    entry_pmkey_dyn.pack(side=tk.LEFT, padx=3)
+
+    ttk.Label(p_row1, text="cmd:").pack(side=tk.LEFT, padx=(8, 3))
+    combo_cmd_dyn = ttk.Combobox(p_row1, values=["read", "write"], width=6, state="readonly")
+    combo_cmd_dyn.set("read")
+    combo_cmd_dyn.pack(side=tk.LEFT, padx=3)
+
+    # Payload Preview & Big Dispatch Button
+    p_row2 = ttk.Frame(f_payload)
+    p_row2.pack(fill=tk.X, pady=(6, 2))
+
+    lbl_payload_preview = tk.Label(
+        p_row2,
+        text='Payload: {"msgid":"...","CMKEY":"...","PMKEY":"...","type":"ondemand","cmd":"read","GPRS_S":3354}',
+        fg="#0d47a1",
+        bg="#e8eaf6",
+        font=("Consolas", 9),
+        anchor=tk.W,
+        relief=tk.SOLID,
+        bd=1,
+        padx=6,
+        pady=3
+    )
+    lbl_payload_preview.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
+    def update_payload_preview(*args):
+        r_name = entry_reg_name_dyn.get().strip() or "MODBUS_REG_NAME"
+        r_val = entry_reg_val_dyn.get().strip() or "0"
+        cm = entry_cmkey_dyn.get().strip() or LIVE_KEYS.get("CMKEY", "155521")
+        pm = entry_pmkey_dyn.get().strip() or LIVE_KEYS.get("PMKEY", "438266")
+        cmd_val = combo_cmd_dyn.get().strip() or "read"
+        payload_obj = build_ondemand_payload(r_name, r_val, cmkey=cm, pmkey=pm, cmd=cmd_val)
+        lbl_payload_preview.config(text=f"Payload: {json.dumps(payload_obj)}")
+
+    entry_reg_name_dyn.bind("<KeyRelease>", update_payload_preview)
+    entry_reg_val_dyn.bind("<KeyRelease>", update_payload_preview)
+    entry_cmkey_dyn.bind("<KeyRelease>", update_payload_preview)
+    entry_pmkey_dyn.bind("<KeyRelease>", update_payload_preview)
+    combo_cmd_dyn.bind("<<ComboboxSelected>>", update_payload_preview)
+
+    def dispatch_immediate_fetch():
         nonlocal active_client, is_connected
         if not is_connected or not active_client:
             messagebox.showwarning("Connection", "Please connect to the MQTT broker first using the 'Connect' button above.")
             return
 
-        target_imei = broker_cfg.get("name", "866738083619898")
-        top = f"rtsg-1/ongridrooftop/{target_imei}/ondemand/sub"
-        payload = "asas"
-        active_client.publish(top, payload, qos=0)
+        imei_target = entry_imei_dyn.get().strip() or broker_cfg.get("name", "866738083619898")
+        top = f"rtsg-1/ongridrooftop/{imei_target}/ondemand/sub"
 
+        r_name = entry_reg_name_dyn.get().strip() or "GPRS_S"
+        r_val = entry_reg_val_dyn.get().strip() or "3354"
+        cm = entry_cmkey_dyn.get().strip() or LIVE_KEYS.get("CMKEY", "155521")
+        pm = entry_pmkey_dyn.get().strip() or LIVE_KEYS.get("PMKEY", "438266")
+        cmd_val = combo_cmd_dyn.get().strip() or "read"
+
+        payload_obj = build_ondemand_payload(r_name, r_val, cmkey=cm, pmkey=pm, cmd=cmd_val)
+        payload_json = json.dumps(payload_obj)
+
+        active_client.publish(top, payload_json, qos=0)
         now_str = datetime.now().strftime("%H:%M:%S")
-        lbl_fetch_feedback.config(text=f"[+] Dispatched Ondemand fetch ('{payload}') to '{top}' at {now_str}! Waiting for response...", fg="#0d47a1")
+        lbl_fetch_status.config(
+            text=f"[✓] Dispatched ondemand '{r_name}' ({r_val}) to '{top}' at {now_str}! Awaiting device response...",
+            fg="#2e7d32"
+        )
 
-    def fetch_gprs_ondemand_action():
-        on_search_gprs_btn()
-        fetch_all_ondemand_action()
-
-    def fetch_selected_register_action():
+    def dispatch_section_fetch():
+        """Dispatches an ondemand fetch for registers in the current section."""
         nonlocal active_client, is_connected
-        selected = tree_regs.selection()
-        if not selected:
-            messagebox.showinfo("Select Register", "Please select a register row from the table first.")
-            return
         if not is_connected or not active_client:
             messagebox.showwarning("Connection", "Please connect to the MQTT broker first using the 'Connect' button above.")
             return
 
-        item = tree_regs.item(selected[0])
-        vals = item.get("values", [])
-        if vals:
-            reg_addr = vals[0]
-            reg_name = vals[1]
-            target_imei = broker_cfg.get("name", "866738083619898")
-            top = f"rtsg-1/ongridrooftop/{target_imei}/ondemand/sub"
-            payload = json.dumps({"reg": reg_addr}) if False else "asas"
-            active_client.publish(top, "asas", qos=0)
-            now_str = datetime.now().strftime("%H:%M:%S")
-            lbl_fetch_feedback.config(text=f"[+] Querying register {reg_addr} ({reg_name}) via '{top}' at {now_str}...", fg="#e65100")
+        imei_target = entry_imei_dyn.get().strip() or broker_cfg.get("name", "866738083619898")
+        top = f"rtsg-1/ongridrooftop/{imei_target}/ondemand/sub"
 
-    btn_fetch_main = tk.Button(row1, text="🚀 FETCH CURRENT VALUES (ONDEMAND)", command=fetch_all_ondemand_action, font=("Segoe UI", 10, "bold"), bg="#28a745", fg="white", relief=tk.RAISED, padx=12, pady=3)
-    btn_fetch_main.pack(side=tk.LEFT, padx=(0, 6))
+        # Also trigger standard trigger to fetch all active registers
+        active_client.publish(top, "asas", qos=0)
+        now_str = datetime.now().strftime("%H:%M:%S")
+        lbl_fetch_status.config(
+            text=f"[✓] Dispatched batch ondemand query for section '{current_section.get()}' to '{top}' at {now_str}!",
+            fg="#1565c0"
+        )
 
-    btn_fetch_gprs_list = tk.Button(row1, text="🌐 FETCH GPRS LIST VALUES", command=fetch_gprs_ondemand_action, font=("Segoe UI", 9, "bold"), bg="#007bff", fg="white", relief=tk.RAISED, padx=10, pady=3)
-    btn_fetch_gprs_list.pack(side=tk.LEFT, padx=4)
+    btn_fetch_immediate = tk.Button(
+        p_row2,
+        text="🚀 IMMEDIATELY FETCH REMOTE DEVICE (ONDEMAND)",
+        command=dispatch_immediate_fetch,
+        font=("Segoe UI", 10, "bold"),
+        bg="#28a745",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=12,
+        pady=4
+    )
+    btn_fetch_immediate.pack(side=tk.RIGHT, padx=4)
 
-    btn_fetch_sel = tk.Button(row1, text="⚡ Fetch Selected Register", command=fetch_selected_register_action, font=("Segoe UI", 9), bg="#ffc107", fg="#212529", relief=tk.RAISED, padx=8, pady=3)
-    btn_fetch_sel.pack(side=tk.LEFT, padx=4)
+    btn_fetch_sec = tk.Button(
+        p_row2,
+        text="⚡ Fetch Section Batch",
+        command=dispatch_section_fetch,
+        font=("Segoe UI", 9, "bold"),
+        bg="#007bff",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=8,
+        pady=4
+    )
+    btn_fetch_sec.pack(side=tk.RIGHT, padx=4)
 
-    lbl_fetch_feedback = tk.Label(row1, text="Ready. Click 'FETCH CURRENT VALUES' to query device via ondemand MQTT topic.", fg="#555", font=("Segoe UI", 9))
-    lbl_fetch_feedback.pack(side=tk.LEFT, padx=10)
+    lbl_fetch_status = tk.Label(
+        f_payload,
+        text="Select any register from the table below, then click 'IMMEDIATELY FETCH REMOTE DEVICE' to query over MQTT.",
+        fg="#616161",
+        font=("Segoe UI", 9)
+    )
+    lbl_fetch_status.pack(fill=tk.X, pady=(4, 0))
 
-    # Register Table Treeview
+    # -------------------------------------------------------------------------
+    # REGISTER TABLE (TREEVIEW WITH AUTO-MAPPER)
+    # -------------------------------------------------------------------------
     reg_table_frame = ttk.Frame(tab_regs)
     reg_table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
-    reg_cols = ("Address", "Register Name", "Category", "Current Value", "Description", "Last Updated")
+    reg_cols = ("Address", "Register Name", "Section / Category", "Current Value", "Description", "Last Updated")
     tree_regs = ttk.Treeview(reg_table_frame, columns=reg_cols, show="headings", selectmode="browse")
 
     tree_regs.heading("Address", text="Modbus Addr", anchor=tk.CENTER)
     tree_regs.heading("Register Name", text="Register Name", anchor=tk.W)
-    tree_regs.heading("Category", text="Category", anchor=tk.CENTER)
+    tree_regs.heading("Section / Category", text="Section / Category", anchor=tk.CENTER)
     tree_regs.heading("Current Value", text="Current Value (Live)", anchor=tk.CENTER)
-    tree_regs.heading("Description", text="Description / Function", anchor=tk.W)
+    tree_regs.heading("Description", text="Description / Firmware Function", anchor=tk.W)
     tree_regs.heading("Last Updated", text="Last Updated", anchor=tk.CENTER)
 
     tree_regs.column("Address", width=95, anchor=tk.CENTER)
-    tree_regs.column("Register Name", width=175, anchor=tk.W)
-    tree_regs.column("Category", width=130, anchor=tk.CENTER)
+    tree_regs.column("Register Name", width=190, anchor=tk.W)
+    tree_regs.column("Section / Category", width=150, anchor=tk.CENTER)
     tree_regs.column("Current Value", width=140, anchor=tk.CENTER)
     tree_regs.column("Description", width=340, anchor=tk.W)
     tree_regs.column("Last Updated", width=115, anchor=tk.CENTER)
@@ -1087,16 +1220,34 @@ def launch_gui(initial_config=None):
     tree_regs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     reg_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def on_tree_select(event):
+        selected = tree_regs.selection()
+        if not selected:
+            return
+        item = tree_regs.item(selected[0])
+        vals = item.get("values", [])
+        if vals:
+            r_addr = str(vals[0])
+            r_name = str(vals[1])
+            entry_reg_name_dyn.delete(0, tk.END)
+            entry_reg_name_dyn.insert(0, r_name)
+            entry_reg_val_dyn.delete(0, tk.END)
+            entry_reg_val_dyn.insert(0, r_addr)
+            update_payload_preview()
+
+    tree_regs.bind("<<TreeviewSelect>>", on_tree_select)
+    tree_regs.bind("<Double-1>", lambda e: dispatch_immediate_fetch())
+
     def apply_filter_regs(*args):
         query = entry_reg_search.get().strip().upper()
-        cat = current_cat_filter.get()
+        sec = current_section.get()
 
         for item in tree_regs.get_children():
             tree_regs.delete(item)
 
         matches = []
         for r in REGISTER_CACHE.values():
-            if cat != "All" and r["category"] != cat:
+            if not sec.startswith("8") and "ALL" not in sec.upper() and r["category"] != sec:
                 continue
             if not query:
                 matches.append(r)
@@ -1121,15 +1272,28 @@ def launch_gui(initial_config=None):
                 ts
             ), tags=(tag,))
 
-        lbl_reg_count.config(text=f"Showing {len(matches)} / {len(REGISTER_CACHE)} registers")
+        lbl_reg_count.config(text=f"Showing {len(matches)} / {len(REGISTER_CACHE)} registers in '{sec}'")
 
     entry_reg_search.bind("<KeyRelease>", apply_filter_regs)
     apply_filter_regs()
+    update_payload_preview()
 
     def update_registers_table(data_dict, now_utc):
         updated_count = 0
         if not data_dict or not isinstance(data_dict, dict):
             return 0
+
+        # Update dynamic CMKEY & PMKEY if present in incoming packet
+        cm = str(data_dict.get("CMKEY", "") or "")
+        pm = str(data_dict.get("PMKEY", "") or "")
+        if cm:
+            LIVE_KEYS["CMKEY"] = cm
+            entry_cmkey_dyn.delete(0, tk.END)
+            entry_cmkey_dyn.insert(0, cm)
+        if pm:
+            LIVE_KEYS["PMKEY"] = pm
+            entry_pmkey_dyn.delete(0, tk.END)
+            entry_pmkey_dyn.insert(0, pm)
 
         regs_dict = data_dict.get("registers", {})
         if isinstance(regs_dict, dict):
@@ -1169,8 +1333,12 @@ def launch_gui(initial_config=None):
             updated_count += 1
 
         apply_filter_regs()
+        update_payload_preview()
         if updated_count > 0:
-            lbl_fetch_feedback.config(text=f"[✓] Received device response! Updated {updated_count} register values at {now_utc} UTC", fg="green")
+            lbl_fetch_status.config(
+                text=f"[✓] Success: Received device response! Updated {updated_count} register values at {now_utc} UTC",
+                fg="#1b5e20"
+            )
         return updated_count
 
     # -------------------------------------------------------------------------
@@ -1708,7 +1876,12 @@ def search_and_fetch_gprs_cli():
 
         elif sub_ch == "4":
             cfg = load_config_file("config.yaml") if os.path.exists("config.yaml") else DEFAULT_CONFIG
-            print("\nDispatching live Ondemand Query ('asas') to device ondemand/sub topic...")
+            r_name = input("Enter register name to query (default: GPRS_S): ").strip() or "GPRS_S"
+            r_val = input("Enter register address / value (default: 3354): ").strip() or "3354"
+            payload_dict = build_ondemand_payload(r_name, r_val, cmkey=LIVE_KEYS.get("CMKEY", "155521"), pmkey=LIVE_KEYS.get("PMKEY", "438266"))
+            payload_str = json.dumps(payload_dict)
+            print(f"\nDispatching live Ondemand Query: {payload_str}")
+            cfg["settings"]["payload_to_send"] = payload_str
             run_live_client(cfg, once=True)
 
         elif sub_ch == "5":
