@@ -38,27 +38,60 @@ def run_tests():
 
     # 3. Test Modbus Registers Map, Sections & Dynamic Payload Builder
     print("[3/4] Testing Modbus Register Map, Sections & Dynamic Payload...")
-    from modbus_registers import ALL_REGISTERS, SECTIONS, search_registers, get_gprs_registers, build_ondemand_payload
+    from modbus_registers import (
+        ALL_REGISTERS,
+        SECTIONS,
+        search_registers,
+        search_across_all_sections,
+        get_gprs_registers,
+        build_ondemand_payload
+    )
+    from MQTT_SERVER_CONTROLLER import load_app_state, save_app_state, APP_STATE_FILE
     assert len(ALL_REGISTERS) >= 200, f"Expected >200 registers, got {len(ALL_REGISTERS)}"
     assert "1. GPRS_Connection" in SECTIONS, "Missing 1. GPRS_Connection in SECTIONS"
     assert "2. SPIFFS_Storage" in SECTIONS, "Missing 2. SPIFFS_Storage in SECTIONS"
     assert "3. Restart_Count" in SECTIONS, "Missing 3. Restart_Count in SECTIONS"
 
-    # Test exact payload structure requested by user
-    payload = build_ondemand_payload("GPRS_S", 3354, cmkey="155521", pmkey="438266", cmd="read")
+    # Test single register payload structure requested by user ("REG_NUMBER": "VAL")
+    payload = build_ondemand_payload("3354", 0, cmkey="155521", pmkey="438266", cmd="read")
     assert payload["type"] == "ondemand", "type must be ondemand"
     assert payload["cmd"] == "read", "cmd must be read"
     assert payload["CMKEY"] == "155521", "CMKEY must match"
     assert payload["PMKEY"] == "438266", "PMKEY must match"
-    assert payload["GPRS_S"] == 3354, "Dynamic reg must match"
+    assert payload["3354"] == 0, "Dynamic reg must match 'REG_NUMBER': 'VAL'"
     assert "msgid" in payload and "timestamp" in payload
+
+    # Test batch payload structure ("REG_NUMBER": "VAL")
+    batch_map = {"3354": 0, "3362": 0, "3364": 0}
+    batch_payload = build_ondemand_payload(batch_dict=batch_map, cmkey="155521", pmkey="438266", cmd="read")
+    assert batch_payload["type"] == "ondemand"
+    assert batch_payload["cmd"] == "read"
+    assert batch_payload["3354"] == 0
+    assert batch_payload["3362"] == 0
+    assert batch_payload["3364"] == 0
+
+    # Test multi-section search with badges
+    overall, counts = search_across_all_sections("GPRS")
+    assert len(overall) >= 5, "Expected at least 5 registers with GPRS in name"
+    assert "1. GPRS_Connection" in counts
+    assert counts["1. GPRS_Connection"] >= 5
+
+    # Test state persistence
+    test_state = {"broker_host": "rms.iotscada-pmsg.com", "target_imei": "866738083619898", "last_reg_name": "GPRS_S"}
+    save_app_state(test_state)
+    loaded_st = load_app_state()
+    assert loaded_st.get("target_imei") == "866738083619898"
+    assert loaded_st.get("last_reg_name") == "GPRS_S"
 
     gprs_list = get_gprs_registers()
     assert len(gprs_list) >= 20, f"Expected >20 GPRS registers, got {len(gprs_list)}"
     gprs_searched = search_registers("GPRS")
     assert len(gprs_searched) >= 5, "Expected at least 5 registers with GPRS in name"
     print(f"      PASS: {len(ALL_REGISTERS)} registers partitioned across {len(SECTIONS)} sections.")
-    print(f"      PASS: Dynamic ondemand payload builder verified: {payload}")
+    print(f"      PASS: Single ondemand payload builder verified: {payload}")
+    print(f"      PASS: Batch ondemand payload builder verified: {batch_payload}")
+    print(f"      PASS: Multi-section search engine verified ({len(overall)} matches, counts: {counts}).")
+    print(f"      PASS: Session state persistence verified (saved to {APP_STATE_FILE}).")
 
     # 4. Test Offline Simulator Handshake
     print("[4/4] Testing Offline Simulator Handshake...")

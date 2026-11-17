@@ -1,0 +1,64 @@
+{
+  "broker_host": "rms.iotscada-pmsg.com",
+  "broker_port": 8883,
+  "broker_user": "test",
+  "broker_use_tls": true,
+  "target_imei": "866738083623411",
+  "selected_section": "2. SPIFFS_Storage",
+  "search_query": "spiff",
+  "search_all_sections": true,
+  "last_reg_num": "3514",
+  "last_reg_val": "1",
+  "cmkey": "976659",
+  "pmkey": "830565",
+  "cmd": "read",
+  "publish_topic": "rtsg-1/ongridrooftop/866738083623411/ondemand/sub",
+  "subscribe_topic": "rtsg-1/ongridrooftop/866738083623411/#",
+  "subscribed_topics": [
+    "rtsg-1/ongridrooftop/866738083619898/#",
+    "rtsg-1/ongridrooftop/866738083619898/ondemand/pub",
+    "rtsg-1/ongridrooftop/866738083619898/data/pub",
+    "rtsg-1/ongridrooftop/866738083619898/heartbeat/pub",
+    "rtsg-1/ongridrooftop/866738083619898/config/pub",
+    "rtsg-1/ongridrooftop/866738083619898/rtevent/pub",
+    "rtsg-1/ongridrooftop/866738083619898/ondemand/sub",
+    "rtsg-1/ongridrooftop/866738083619898/config/sub",
+    "rtsg-1/ongridrooftop/866738083619898/messagekey/sub",
+    "rtsg-1/ongridrooftop/866738083619898/info/sub",
+    "rtsg-1/ongridrooftop/866738083619898/+/+",
+    "rtsg-1/ongridrooftop/866738083623411/#",
+    "rtsg-1/ongridrooftop/866738083623411/ondemand/pub",
+    "rtsg-1/ongridrooftop/866738083623411/data/pub",
+    "rtsg-1/ongridrooftop/866738083623411/messagekey/sub",
+    "rtsg-1/ongridrooftop/866738083623411/config/pub",
+    "rtsg-1/ongridrooftop/866738083623411/rtevent/pub",
+    "rtsg-1/ongridrooftop/866738083623411/heartbeat/pub",
+    "rtsg-1/ongridrooftop/866738083623411/info/sub"
+  ],
+  "cached_register_values": {
+    "2962": {
+      "value": "1",
+      "updated_at": "06:15:31"
+    },
+    "3430": {
+      "value": "80",
+      "updated_at": "06:15:31"
+    },
+    "3496": {
+      "value": "443",
+      "updated_at": "06:15:31"
+    },
+    "3554": {
+      "value": "976659",
+      "updated_at": "06:22:28"
+    },
+    "3956": {
+      "value": "976659",
+      "updated_at": "06:22:28"
+    },
+    "3958": {
+      "value": "830565",
+      "updated_at": "06:22:28"
+    }
+  }
+}

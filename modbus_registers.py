@@ -1311,18 +1311,42 @@ def search_registers(query="", section="8. All_Registers"):
             results.append(r)
     return results
 
-def build_ondemand_payload(reg_name, reg_val, cmkey="155521", pmkey="438266", cmd="read", custom_timestamp=None):
+def search_across_all_sections(query=""):
+    """
+    Searches across all registers and groups matches by section.
+    Returns:
+      overall_matches: list of matching register dicts
+      section_counts: dict of {section_name: count_of_matches}
+    """
+    q = query.strip().upper()
+    overall = []
+    section_counts = {s: 0 for s in SECTIONS if not s.startswith("8")}
+    for r in ALL_REGISTERS:
+        sec = r.get("category", "")
+        if not q:
+            overall.append(r)
+            if sec in section_counts:
+                section_counts[sec] += 1
+        else:
+            if (q in str(r["address"]) or 
+                q in r["name"].upper() or 
+                q in r.get("description", "").upper() or
+                q in sec.upper()):
+                overall.append(r)
+                if sec in section_counts:
+                    section_counts[sec] += 1
+    return overall, section_counts
+
+def build_ondemand_payload(reg_name, reg_val=None, cmkey="155521", pmkey="438266", cmd="read", custom_timestamp=None, batch_dict=None):
     """
     Constructs the exact requested JSON ondemand payload:
-    {"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","timestamp":"2026-09-07 13:35:32","type":"ondemand","cmd":"read","MODBUS_REG_NAME":VALUE_REG_GIVEN_BY_REG}
+    Single register:
+      {"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","timestamp":"2026-09-07 13:35:32","type":"ondemand","cmd":"read","MODBUS_REG_NAME":VALUE_REG_GIVEN_BY_REG}
+    Batch / Multi-register:
+      {"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","timestamp":"...","type":"ondemand","cmd":"read","REG1":VAL1,"REG2":VAL2,...}
     """
     msgid = str(random.randint(1000000, 9999999))
     now_ts = custom_timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Format value: integer if digits, else string or raw
-    val = reg_val
-    if isinstance(reg_val, str) and reg_val.isdigit():
-        val = int(reg_val)
 
     payload = {
         "msgid": str(msgid),
@@ -1331,6 +1355,24 @@ def build_ondemand_payload(reg_name, reg_val, cmkey="155521", pmkey="438266", cm
         "timestamp": now_ts,
         "type": "ondemand",
         "cmd": str(cmd or "read"),
-        str(reg_name): val
     }
+
+    if batch_dict and isinstance(batch_dict, dict):
+        for k, v in batch_dict.items():
+            val = v
+            if isinstance(v, str) and v.isdigit():
+                val = int(v)
+            payload[str(k)] = val
+    elif isinstance(reg_name, dict):
+        for k, v in reg_name.items():
+            val = v
+            if isinstance(v, str) and v.isdigit():
+                val = int(v)
+            payload[str(k)] = val
+    else:
+        val = reg_val
+        if isinstance(reg_val, str) and reg_val.isdigit():
+            val = int(reg_val)
+        payload[str(reg_name)] = val
+
     return payload
