@@ -55,7 +55,7 @@
         "auto_poll": true,
         "poll_interval_seconds": 15,
         "response_timeout_seconds": 30,
-        "payload_to_send": "asas"
+        "payload_to_send": "{\"msgid\":\"6374196\",\"CMKEY\":\"155521\",\"PMKEY\":\"438266\",\"type\":\"ondemand\",\"cmd\":\"read\",\"3355\":0}"
       },
       "registered_devices": [
         {

@@ -21,6 +21,7 @@ import time
 import json
 import ssl
 import socket
+import struct
 import csv
 import glob
 import random
@@ -91,16 +92,40 @@ def load_app_state():
     if os.path.exists(APP_STATE_FILE):
         try:
             with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                st = json.load(f)
+                target_imei = st.get("target_imei", "")
+                if target_imei and "subscribed_topics" in st:
+                    # Filter out any foreign IMEIs from topic list
+                    st["subscribed_topics"] = [t for t in st["subscribed_topics"] if target_imei in t]
+                return st
         except Exception:
             pass
     return {}
 
 def save_app_state(state_dict):
-    """Saves UI and application session state into app_state.json."""
+    """Saves UI and application session state into app_state.json, strictly binding topics to target_imei."""
     try:
         current = load_app_state()
         current.update(state_dict)
+        target_imei = current.get("target_imei", "").strip()
+        if target_imei:
+            if "subscribed_topics" in current:
+                current["subscribed_topics"] = [t for t in current["subscribed_topics"] if target_imei in t]
+                if not current["subscribed_topics"]:
+                    current["subscribed_topics"] = [
+                        f"rtsg-1/ongridrooftop/{target_imei}/#",
+                        f"rtsg-1/ongridrooftop/{target_imei}/ondemand/pub",
+                        f"rtsg-1/ongridrooftop/{target_imei}/data/pub",
+                        f"rtsg-1/ongridrooftop/{target_imei}/messagekey/sub",
+                        f"rtsg-1/ongridrooftop/{target_imei}/config/pub",
+                        f"rtsg-1/ongridrooftop/{target_imei}/rtevent/pub",
+                        f"rtsg-1/ongridrooftop/{target_imei}/heartbeat/pub",
+                        f"rtsg-1/ongridrooftop/{target_imei}/info/sub"
+                    ]
+            if "publish_topic" in current and target_imei not in current["publish_topic"]:
+                current["publish_topic"] = f"rtsg-1/ongridrooftop/{target_imei}/ondemand/sub"
+            if "subscribe_topic" in current and target_imei not in current["subscribe_topic"]:
+                current["subscribe_topic"] = f"rtsg-1/ongridrooftop/{target_imei}/#"
         with open(APP_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2)
     except Exception:
@@ -138,23 +163,23 @@ DEFAULT_CONFIG = {
         "config_pub_template": "rtsg-1/ongridrooftop/{imei}/config/pub",
         "rtevent_pub_template": "rtsg-1/ongridrooftop/{imei}/rtevent/pub",
         "info_subscriptions": [
-            "rtsg-1/ongridrooftop/866738083619898/#",
-            "rtsg-1/ongridrooftop/866738083619898/ondemand/pub",
-            "rtsg-1/ongridrooftop/866738083619898/data/pub",
-            "rtsg-1/ongridrooftop/866738083619898/heartbeat/pub",
-            "rtsg-1/ongridrooftop/866738083619898/config/pub",
-            "rtsg-1/ongridrooftop/866738083619898/rtevent/pub",
-            "rtsg-1/ongridrooftop/866738083619898/ondemand/sub",
-            "rtsg-1/ongridrooftop/866738083619898/config/sub",
-            "rtsg-1/ongridrooftop/866738083619898/messagekey/sub",
-            "rtsg-1/ongridrooftop/866738083619898/info/sub"
+            "rtsg-1/ongridrooftop/{imei}/#",
+            "rtsg-1/ongridrooftop/{imei}/ondemand/pub",
+            "rtsg-1/ongridrooftop/{imei}/data/pub",
+            "rtsg-1/ongridrooftop/{imei}/heartbeat/pub",
+            "rtsg-1/ongridrooftop/{imei}/config/pub",
+            "rtsg-1/ongridrooftop/{imei}/rtevent/pub",
+            "rtsg-1/ongridrooftop/{imei}/ondemand/sub",
+            "rtsg-1/ongridrooftop/{imei}/config/sub",
+            "rtsg-1/ongridrooftop/{imei}/messagekey/sub",
+            "rtsg-1/ongridrooftop/{imei}/info/sub"
         ]
     },
     "settings": {
         "auto_poll": False,
         "poll_interval_seconds": 15,
         "response_timeout_seconds": 30,
-        "payload_to_send": "asas",
+        "payload_to_send": '{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}',
         "auto_reply_messagekey": True,
         "target_imei_only": True,
         "rtevent_display_mode": "compact"
@@ -227,8 +252,126 @@ def get_saved_password(host, username="", port=8883):
 
 
 # ==============================================================================
-#                  LOCAL WIFI DEVICE CONTROLLER (DIRECT LAN / AP)
+#           LOCAL WIFI & MODBUS POLL TCP/IP PROTOCOL ENGINE (DIRECT LAN / AP)
 # ==============================================================================
+
+MODBUS_TRANSACTION_ID = 1
+
+def get_next_modbus_trans_id():
+    """Generates sequential Modbus TCP transaction IDs."""
+    global MODBUS_TRANSACTION_ID
+    tid = MODBUS_TRANSACTION_ID
+    MODBUS_TRANSACTION_ID = (MODBUS_TRANSACTION_ID + 1) & 0xFFFF
+    if MODBUS_TRANSACTION_ID == 0:
+        MODBUS_TRANSACTION_ID = 1
+    return tid
+
+
+def calc_modbus_crc16(data: bytes) -> int:
+    """Calculates Modbus RTU CRC-16 (polynomial 0xA001)."""
+    crc = 0xFFFF
+    for pos in data:
+        crc ^= pos
+        for _ in range(8):
+            if (crc & 1) != 0:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+
+def build_modbus_tcp_read_packet(unit_id=1, func_code=3, start_addr=3355, quantity=1, trans_id=None):
+    """
+    Builds standard Modbus TCP/IP Read request frame (MBAP 7 bytes + PDU 5 bytes = 12 bytes).
+    Func 03 = Read Holding Registers, Func 04 = Read Input Registers.
+    """
+    if trans_id is None:
+        trans_id = get_next_modbus_trans_id()
+    pdu = struct.pack(">BHH", func_code, start_addr, quantity)
+    # MBAP: TransID(2B) + ProtoID(2B=0x0000) + Length(2B) + UnitID(1B)
+    mbap = struct.pack(">HHHB", trans_id, 0, len(pdu) + 1, unit_id)
+    return mbap + pdu, trans_id
+
+
+def build_modbus_tcp_write_packet(unit_id=1, reg_addr=3355, value=0, trans_id=None):
+    """Builds standard Modbus TCP/IP Write Single Register frame (Func 06)."""
+    if trans_id is None:
+        trans_id = get_next_modbus_trans_id()
+    pdu = struct.pack(">BHH", 6, reg_addr, value & 0xFFFF)
+    mbap = struct.pack(">HHHB", trans_id, 0, len(pdu) + 1, unit_id)
+    return mbap + pdu, trans_id
+
+
+def parse_modbus_tcp_response(resp_bytes: bytes, start_reg: int = 3355):
+    """
+    Parses Modbus TCP response frame (MBAP + PDU).
+    Returns: (success: bool, registers_dict: dict, description: str, func_code: int, exc_code: int)
+    """
+    if len(resp_bytes) < 9:
+        return False, {}, f"Response frame too short ({len(resp_bytes)} bytes)", 0, 0
+    trans_id, proto_id, length, unit_id, func_code = struct.unpack(">HHHBB", resp_bytes[:8])
+    if func_code >= 0x80:
+        exc_code = resp_bytes[8]
+        exc_names = {
+            1: "Illegal Function (Function not supported by device)",
+            2: "Illegal Data Address (Register address out of range)",
+            3: "Illegal Data Value (Value not accepted)",
+            4: "Slave Device Failure (Internal device error)",
+            5: "Acknowledge",
+            6: "Slave Device Busy",
+            10: "Gateway Path Unavailable",
+            11: "Gateway Target Device Failed to Respond"
+        }
+        return False, {}, f"Modbus Exception 0x{func_code:02X} (Code {exc_code}: {exc_names.get(exc_code, 'Unknown Error')})", func_code, exc_code
+
+    if func_code in (3, 4):
+        byte_cnt = resp_bytes[8]
+        val_bytes = resp_bytes[9:9+byte_cnt]
+        num_regs = len(val_bytes) // 2
+        regs = {}
+        for i in range(num_regs):
+            val = struct.unpack(">H", val_bytes[i*2:i*2+2])[0]
+            regs[str(start_reg + i)] = val
+        return True, regs, f"Read {num_regs} register(s) successfully", func_code, 0
+    elif func_code == 6:
+        addr, val = struct.unpack(">HH", resp_bytes[8:12])
+        return True, {str(start_reg): val}, f"Written Register {addr} = {val} successfully", func_code, 0
+    return True, {}, f"Function code {func_code} received", func_code, 0
+
+
+def build_modbus_rtu_packet(unit_id=1, func_code=3, addr=3355, qty_or_val=1):
+    """Builds Modbus RTU frame with CRC-16."""
+    payload = struct.pack(">BBHH", unit_id, func_code, addr, qty_or_val)
+    crc = calc_modbus_crc16(payload)
+    return payload + struct.pack("<H", crc)
+
+
+def parse_modbus_rtu_response(resp_bytes: bytes, start_reg: int = 3355):
+    """Parses Modbus RTU response frame."""
+    if len(resp_bytes) < 5:
+        return False, {}, f"RTU frame too short ({len(resp_bytes)} bytes)", 0, 0
+    expected_crc = calc_modbus_crc16(resp_bytes[:-2])
+    actual_crc = struct.unpack("<H", resp_bytes[-2:])[0]
+    if expected_crc != actual_crc:
+        return False, {}, f"Modbus RTU CRC mismatch (expected 0x{expected_crc:04X}, received 0x{actual_crc:04X})", 0, 0
+    unit_id, func_code = resp_bytes[0], resp_bytes[1]
+    if func_code >= 0x80:
+        exc_code = resp_bytes[2]
+        return False, {}, f"Modbus Exception 0x{func_code:02X} Code {exc_code}", func_code, exc_code
+    if func_code in (3, 4):
+        byte_cnt = resp_bytes[2]
+        val_bytes = resp_bytes[3:3+byte_cnt]
+        num_regs = len(val_bytes) // 2
+        regs = {}
+        for i in range(num_regs):
+            val = struct.unpack(">H", val_bytes[i*2:i*2+2])[0]
+            regs[str(start_reg + i)] = val
+        return True, regs, f"Read {num_regs} register(s) successfully", func_code, 0
+    elif func_code == 6:
+        addr, val = struct.unpack(">HH", resp_bytes[2:6])
+        return True, {str(start_reg): val}, f"Written Register {addr} = {val} successfully", func_code, 0
+    return True, {}, f"Function code {func_code} received", func_code, 0
+
 
 def ping_local_wifi_device(ip, port, timeout=2.0):
     """Pings/tests TCP connectivity to a local WiFi device (e.g. ESP32/Modbus gateway)."""
@@ -245,20 +388,174 @@ def ping_local_wifi_device(ip, port, timeout=2.0):
         return False, rtt_ms, str(e)
 
 
-def query_local_wifi_device(ip, port, protocol, payload_dict, timeout=3.5):
+def query_modbus_device(ip, port=502, unit_id=1, func_code=3, reg_addr=3355, quantity=1, value=0, is_write=False, zero_based=True, is_rtu=False, timeout=2.5):
     """
-    Dispatches ondemand register query to a local WiFi device via HTTP POST, HTTP GET, or TCP Socket.
-    Returns: (success: bool, response_dict: dict, raw_text: str, rtt_ms: float, error_msg: str)
+    Dispatches native Modbus TCP or Modbus RTU-over-TCP request.
+    Returns: (success: bool, registers_dict: dict, tx_hex: str, rx_hex: str, rtt_ms: float, error_msg: str, trace_log: str)
     """
-    import urllib.request
-    import urllib.error
-    import urllib.parse
     t0 = time.time()
-    payload_json = json.dumps(payload_dict)
+    wire_addr = (reg_addr - 1) if (zero_based and reg_addr > 0) else reg_addr
+
+    if is_rtu:
+        if is_write:
+            tx_bytes = build_modbus_rtu_packet(unit_id=unit_id, func_code=6, addr=wire_addr, qty_or_val=value)
+            cmd_desc = f"Modbus RTU Write Reg (Unit: {unit_id}, Addr: {reg_addr} -> Wire: {wire_addr}, Val: {value})"
+        else:
+            tx_bytes = build_modbus_rtu_packet(unit_id=unit_id, func_code=func_code, addr=wire_addr, qty_or_val=quantity)
+            cmd_desc = f"Modbus RTU Read Regs (Unit: {unit_id}, Func: {func_code}, Addr: {reg_addr} -> Wire: {wire_addr}, Qty: {quantity})"
+    else:
+        if is_write:
+            tx_bytes, tid = build_modbus_tcp_write_packet(unit_id=unit_id, reg_addr=wire_addr, value=value)
+            cmd_desc = f"Modbus TCP Write Reg (Unit: {unit_id}, Func: 06, Addr: {reg_addr} -> Wire: {wire_addr}, Val: {value}, TID: {tid})"
+        else:
+            tx_bytes, tid = build_modbus_tcp_read_packet(unit_id=unit_id, func_code=func_code, start_addr=wire_addr, quantity=quantity)
+            cmd_desc = f"Modbus TCP Read Regs (Unit: {unit_id}, Func: 0{func_code}, Addr: {reg_addr} -> Wire: {wire_addr}, Qty: {quantity}, TID: {tid})"
+
+    tx_hex = " ".join(f"{b:02X}" for b in tx_bytes)
+    now_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, int(port)))
+        s.sendall(tx_bytes)
+        rx_bytes = s.recv(1024)
+        s.close()
+        rtt_ms = round((time.time() - t0) * 1000.0, 1)
+        rx_hex = " ".join(f"{b:02X}" for b in rx_bytes)
+
+        if is_rtu:
+            ok, regs, desc, fc, exc = parse_modbus_rtu_response(rx_bytes, start_reg=reg_addr)
+        else:
+            ok, regs, desc, fc, exc = parse_modbus_tcp_response(rx_bytes, start_reg=reg_addr)
+
+        trace = (
+            f"[{now_str}] >>> MODBUS TX -> {ip}:{port}\n"
+            f"  Command : {cmd_desc}\n"
+            f"  Raw Hex : [ {tx_hex} ] ({len(tx_bytes)} bytes)\n"
+            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] <<< MODBUS RX <- {ip}:{port} (RTT: {rtt_ms} ms)\n"
+            f"  Raw Hex : [ {rx_hex} ] ({len(rx_bytes)} bytes)\n"
+            f"  Result  : {'SUCCESS' if ok else 'ERROR'} | {desc}\n"
+        )
+        if ok and regs:
+            reg_lines = [f"  Reg {r} = {v} (0x{v:04X})" for r, v in regs.items()]
+            trace += "\n".join(reg_lines) + "\n"
+
+        return ok, regs, tx_hex, rx_hex, rtt_ms, ("" if ok else desc), trace
+
+    except Exception as e:
+        rtt_ms = round((time.time() - t0) * 1000.0, 1)
+        err_str = str(e) or "Timeout / Connection Failed"
+        trace = (
+            f"[{now_str}] >>> MODBUS TX -> {ip}:{port}\n"
+            f"  Command : {cmd_desc}\n"
+            f"  Raw Hex : [ {tx_hex} ] ({len(tx_bytes)} bytes)\n"
+            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] ✗ ERROR <- {ip}:{port} (RTT: {rtt_ms} ms)\n"
+            f"  Failure : {err_str}\n"
+        )
+        return False, {}, tx_hex, "", rtt_ms, err_str, trace
+
+
+def probe_wifi_device_protocols(ip, default_port=502, timeout=1.5):
+    """
+    Automatically probes remote WiFi device to detect protocol:
+    1. Modbus TCP on Port 502 / default_port
+    2. Modbus TCP on Port 5020 / 8899
+    3. Modbus RTU over TCP on Port 502 / 8899
+    4. HTTP API on Port 80 / 8080
+    Returns: (found: bool, detected_proto: str, working_port: int, slave_id: int, rtt_ms: float, details: str)
+    """
+    ports_to_try = [int(default_port)] if int(default_port) not in [502, 80] else []
+    ports_to_try.extend([502, 80, 8080, 8899, 5020])
+    ports_to_try = list(dict.fromkeys(ports_to_try))
+
+    # 1. Try Modbus TCP
+    for p in ports_to_try:
+        for uid in (1, 255, 0):
+            ok, regs, tx, rx, rtt, err, tr = query_modbus_device(ip, port=p, unit_id=uid, func_code=3, reg_addr=3355, quantity=1, zero_based=True, is_rtu=False, timeout=timeout)
+            if ok or (rx and len(rx) >= 9):
+                return True, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", p, uid, rtt, f"Modbus TCP detected on Port {p} (Unit ID {uid}, RTT {rtt} ms)"
+            ok4, regs4, tx4, rx4, rtt4, err4, tr4 = query_modbus_device(ip, port=p, unit_id=uid, func_code=4, reg_addr=3355, quantity=1, zero_based=True, is_rtu=False, timeout=timeout)
+            if ok4 or (rx4 and len(rx4) >= 9):
+                return True, "Modbus TCP/IP (Port 502 - Func 04 Input Regs)", p, uid, rtt4, f"Modbus TCP (Func 04) detected on Port {p} (Unit ID {uid}, RTT {rtt4} ms)"
+
+    # 2. Try Modbus RTU over TCP
+    for p in [502, 8899]:
+        ok, regs, tx, rx, rtt, err, tr = query_modbus_device(ip, port=p, unit_id=1, func_code=3, reg_addr=3355, quantity=1, is_rtu=True, timeout=timeout)
+        if ok:
+            return True, "Modbus RTU over TCP (Port 502 / 8899)", p, 1, rtt, f"Modbus RTU over TCP detected on Port {p} (RTT {rtt} ms)"
+
+    # 3. Try HTTP
+    for p in [80, 8080]:
+        try:
+            t0 = time.time()
+            req = urllib.request.Request(f"http://{ip}:{p}/", headers={'User-Agent': 'ModbusProbe'}, method='GET')
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                rtt = round((time.time() - t0) * 1000.0, 1)
+                return True, "HTTP POST (/ondemand)", p, 1, rtt, f"HTTP Server detected on Port {p} (Status {resp.status}, RTT {rtt} ms)"
+        except Exception:
+            pass
+
+    # 4. Fallback TCP Ping
+    for p in ports_to_try:
+        ok_ping, rtt_ping, _ = ping_local_wifi_device(ip, p, timeout=timeout)
+        if ok_ping:
+            return True, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", p, 1, rtt_ping, f"TCP Port {p} is OPEN! Connected as Modbus TCP (RTT {rtt_ping} ms)"
+
+    return False, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", 502, 1, 0.0, f"No responding Modbus or HTTP services found on {ip}"
+
+
+def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_based=True, timeout=3.5):
+    """
+    Dispatches query to a local WiFi device via Modbus TCP, Modbus RTU over TCP, HTTP POST, HTTP GET, or TCP Socket.
+    Returns: (success: bool, response_dict: dict, raw_text: str, rtt_ms: float, error_msg: str, trace_log: str)
+    """
     proto_up = protocol.upper()
 
-    if "POST" in proto_up:
-        # Standard HTTP POST /ondemand
+    # 1. Modbus TCP or RTU over TCP
+    if "MODBUS" in proto_up:
+        is_rtu = "RTU" in proto_up
+        func_code = 4 if ("04" in proto_up or "INPUT" in proto_up) else 3
+        cmd = payload_dict.get("cmd", "read").lower()
+        is_write = (cmd == "write")
+
+        # Extract register number and value from payload
+        reg_num = 3355
+        reg_val = 0
+        for k, v in payload_dict.items():
+            if k not in ["msgid", "CMKEY", "PMKEY", "timestamp", "type", "cmd"]:
+                try:
+                    reg_num = int(k)
+                    reg_val = int(v) if str(v).isdigit() else 0
+                    break
+                except ValueError:
+                    pass
+
+        # Check if multiple registers in batch read
+        reg_keys = [int(k) for k in payload_dict.keys() if k not in ["msgid", "CMKEY", "PMKEY", "timestamp", "type", "cmd"] and str(k).isdigit()]
+        if len(reg_keys) > 1 and not is_write:
+            min_r = min(reg_keys)
+            max_r = max(reg_keys)
+            qty = max(1, min(max_r - min_r + 1, 125))
+            ok, regs, tx, rx, rtt, err, trace = query_modbus_device(
+                ip, port=int(port), unit_id=unit_id, func_code=func_code,
+                reg_addr=min_r, quantity=qty, value=0, is_write=False,
+                zero_based=zero_based, is_rtu=is_rtu, timeout=timeout
+            )
+            filtered_regs = {str(k): regs.get(str(k), 1) for k in reg_keys} if ok else {}
+            return ok, filtered_regs, (rx or tx), rtt, err, trace
+        else:
+            ok, regs, tx, rx, rtt, err, trace = query_modbus_device(
+                ip, port=int(port), unit_id=unit_id, func_code=func_code,
+                reg_addr=reg_num, quantity=1, value=reg_val, is_write=is_write,
+                zero_based=zero_based, is_rtu=is_rtu, timeout=timeout
+            )
+            return ok, regs, (rx or tx), rtt, err, trace
+
+    # 2. HTTP POST
+    elif "POST" in proto_up:
+        t0 = time.time()
+        payload_json = json.dumps(payload_dict)
         url = f"http://{ip}:{port}/ondemand"
         req = urllib.request.Request(
             url,
@@ -271,40 +568,20 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, timeout=3.5):
                 raw_bytes = resp.read()
                 raw_text = raw_bytes.decode('utf-8', errors='replace')
                 rtt_ms = round((time.time() - t0) * 1000.0, 1)
+                trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP POST {url} -> 200 OK ({rtt_ms} ms)\nResponse: {raw_text}\n"
                 try:
                     data = json.loads(raw_text)
-                    return True, data, raw_text, rtt_ms, ""
+                    return True, data, raw_text, rtt_ms, "", trace
                 except json.JSONDecodeError:
-                    return True, {}, raw_text, rtt_ms, "Non-JSON response"
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                try:
-                    url_root = f"http://{ip}:{port}/"
-                    req2 = urllib.request.Request(
-                        url_root,
-                        data=payload_json.encode('utf-8'),
-                        headers={'Content-Type': 'application/json'},
-                        method='POST'
-                    )
-                    with urllib.request.urlopen(req2, timeout=timeout) as resp2:
-                        raw_bytes = resp2.read()
-                        raw_text = raw_bytes.decode('utf-8', errors='replace')
-                        rtt_ms = round((time.time() - t0) * 1000.0, 1)
-                        try:
-                            data = json.loads(raw_text)
-                            return True, data, raw_text, rtt_ms, ""
-                        except json.JSONDecodeError:
-                            return True, {}, raw_text, rtt_ms, ""
-                except Exception:
-                    pass
-            rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            return False, {}, str(e), rtt_ms, f"HTTP Error {e.code}: {e.reason}"
+                    return True, {}, raw_text, rtt_ms, "", trace
         except Exception as e:
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            return False, {}, "", rtt_ms, str(e)
+            trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP POST {url} -> Failed: {e} ({rtt_ms} ms)\n"
+            return False, {}, "", rtt_ms, str(e), trace
 
+    # 3. HTTP GET
     elif "GET" in proto_up:
-        # HTTP GET /ondemand with query parameters
+        t0 = time.time()
         params = [f"{k}={urllib.parse.quote(str(v))}" for k, v in payload_dict.items()]
         query_str = "&".join(params)
         url = f"http://{ip}:{port}/ondemand?{query_str}"
@@ -314,17 +591,21 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, timeout=3.5):
                 raw_bytes = resp.read()
                 raw_text = raw_bytes.decode('utf-8', errors='replace')
                 rtt_ms = round((time.time() - t0) * 1000.0, 1)
+                trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP GET {url} -> 200 OK ({rtt_ms} ms)\nResponse: {raw_text}\n"
                 try:
                     data = json.loads(raw_text)
-                    return True, data, raw_text, rtt_ms, ""
+                    return True, data, raw_text, rtt_ms, "", trace
                 except json.JSONDecodeError:
-                    return True, {}, raw_text, rtt_ms, ""
+                    return True, {}, raw_text, rtt_ms, "", trace
         except Exception as e:
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            return False, {}, "", rtt_ms, str(e)
+            trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP GET {url} -> Failed: {e} ({rtt_ms} ms)\n"
+            return False, {}, "", rtt_ms, str(e), trace
 
+    # 4. TCP Direct Socket (JSON)
     else:
-        # TCP Direct Socket (JSON)
+        t0 = time.time()
+        payload_json = json.dumps(payload_dict)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
@@ -334,15 +615,16 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, timeout=3.5):
             s.close()
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
             raw_text = resp_bytes.decode('utf-8', errors='replace')
+            trace = f"[{datetime.now().strftime('%H:%M:%S')}] TCP Direct -> {ip}:{port} ({rtt_ms} ms)\nResponse: {raw_text}\n"
             try:
                 data = json.loads(raw_text.strip())
-                return True, data, raw_text, rtt_ms, ""
+                return True, data, raw_text, rtt_ms, "", trace
             except json.JSONDecodeError:
-                return True, {}, raw_text, rtt_ms, ""
+                return True, {}, raw_text, rtt_ms, "", trace
         except Exception as e:
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            return False, {}, "", rtt_ms, str(e)
-
+            trace = f"[{datetime.now().strftime('%H:%M:%S')}] TCP Direct {ip}:{port} -> Failed: {e} ({rtt_ms} ms)\n"
+            return False, {}, "", rtt_ms, str(e), trace
 
 # ==============================================================================
 #                  RTEVENT EXCEL (CSV) & TEXT LOGGING
@@ -672,7 +954,7 @@ def load_xml(filepath):
         cfg["settings"]["auto_poll"] = get_text(s_node, "auto_poll", "true").lower() == "true"
         cfg["settings"]["poll_interval_seconds"] = int(get_text(s_node, "poll_interval_seconds", "15"))
         cfg["settings"]["response_timeout_seconds"] = int(get_text(s_node, "response_timeout_seconds", "30"))
-        cfg["settings"]["payload_to_send"] = get_text(s_node, "payload_to_send", "asas")
+        cfg["settings"]["payload_to_send"] = get_text(s_node, "payload_to_send", '{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}')
 
     rd_node = root.find("registered_devices")
     if rd_node is not None:
@@ -726,7 +1008,7 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
     connect_timeout = int(broker.get("connect_timeout", 30))
 
     settings = config.get("settings", {})
-    payload_to_send = settings.get("payload_to_send", "asas")
+    payload_to_send = settings.get("payload_to_send", '{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}')
     target_imei_only = bool(settings.get("target_imei_only", True))
     rtevent_mode = settings.get("rtevent_display_mode", "compact").lower()
 
@@ -897,9 +1179,14 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
             # Auto-Dispatch ondemand trigger if configured (default True)
             auto_reply_messagekey = settings.get("auto_reply_messagekey", True)
             if auto_reply_messagekey:
-                print(f">>> [AUTO-DISPATCH ONDEMAND] Handshake key received -> Sending '{payload_to_send}' to {target_topic} ...")
+                # Dispatch valid ondemand JSON query using received/live keys
+                cm_dyn = str(LIVE_KEYS.get("CMKEY", "155521"))
+                pm_dyn = str(LIVE_KEYS.get("PMKEY", "438266"))
+                ondemand_auto_dict = build_ondemand_payload("3355", 0, cmkey=cm_dyn, pmkey=pm_dyn, cmd="read")
+                auto_payload_str = json.dumps(ondemand_auto_dict)
+                print(f">>> [AUTO-DISPATCH ONDEMAND] Handshake key received -> Sending dynamic JSON query to {target_topic} ...")
                 state["last_dispatch_time"] = time.time()
-                cli.publish(target_topic, payload_to_send, qos=0)
+                cli.publish(target_topic, auto_payload_str, qos=0)
             print("=" * 80)
 
         else:
@@ -991,7 +1278,7 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
         else:
             print(f"\n[+] Listening for target IMEI '{primary_imei}'.")
             print("--------------------------------------------------------------------------------")
-            print("  [KEYBOARD SHORTCUT] Press [Enter] anytime to send Ondemand request ('asas')")
+            print("  [KEYBOARD SHORTCUT] Press [Enter] anytime to send Ondemand request JSON")
             print("  Type 'q' and press [Enter] to stop and disconnect.")
             print("--------------------------------------------------------------------------------\n")
 
@@ -1207,6 +1494,8 @@ def launch_gui(initial_config=None):
     }
 
     sec_buttons = {}
+    wifi_sec_buttons = {}
+    tree_wifi_regs = None
 
     def switch_section(sec_name):
         current_section.set(sec_name)
@@ -1214,11 +1503,12 @@ def launch_gui(initial_config=None):
             var_search_all.set(True)
         else:
             var_search_all.set(False)
-        for name, btn in sec_buttons.items():
-            if name == sec_name:
-                btn.config(relief=tk.SUNKEN, bd=3)
-            else:
-                btn.config(relief=tk.RAISED, bd=1)
+        for btn_dict in (sec_buttons, wifi_sec_buttons):
+            for name, btn in btn_dict.items():
+                if name == sec_name:
+                    btn.config(relief=tk.SUNKEN, bd=3)
+                else:
+                    btn.config(relief=tk.RAISED, bd=1)
         apply_filter_regs()
 
     for sec in SECTIONS:
@@ -1293,8 +1583,11 @@ def launch_gui(initial_config=None):
         if imei_val:
             entry_pub_topic_tab1.delete(0, tk.END)
             entry_pub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{imei_val}/ondemand/sub")
-            entry_sub_topic_tab1.delete(0, tk.END)
-            entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{imei_val}/#")
+            if 'entry_sub_topic_tab1' in locals():
+                entry_sub_topic_tab1.delete(0, tk.END)
+                entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{imei_val}/#")
+            if len(imei_val) >= 10:
+                set_dynamic_imei_topics(imei_val)
             update_payload_preview()
 
     entry_imei_dyn.bind("<KeyRelease>", on_imei_changed)
@@ -1663,8 +1956,10 @@ def launch_gui(initial_config=None):
         selected = tree_regs.selection()
         cnt = len(selected)
         lbl_selection_count.config(text=f"{cnt} registers selected for batch")
+        if 'lbl_wifi_selection_count' in locals():
+            lbl_wifi_selection_count.config(text=f"{cnt} registers selected for batch")
         if cnt == 1:
-            item = tree_regs.item(selected[0])
+            item = tree_regs.item(selected[0]) if tree_regs.exists(selected[0]) else (tree_wifi_regs.item(selected[0]) if ('tree_wifi_regs' in locals() and tree_wifi_regs is not None and tree_wifi_regs.exists(selected[0])) else {})
             vals = item.get("values", [])
             if vals:
                 r_addr = str(vals[0])
@@ -1672,6 +1967,10 @@ def launch_gui(initial_config=None):
                 entry_reg_num_dyn.delete(0, tk.END)
                 entry_reg_num_dyn.insert(0, r_addr)
                 lbl_reg_name_hint.config(text=f"[{r_name}]")
+                if 'entry_wifi_reg_num_dyn' in locals():
+                    entry_wifi_reg_num_dyn.delete(0, tk.END)
+                    entry_wifi_reg_num_dyn.insert(0, r_addr)
+                    lbl_wifi_reg_name_hint.config(text=f"[{r_name}]")
         elif cnt > 1:
             lbl_reg_name_hint.config(text=f"[Batch of {cnt} registers]")
         update_payload_preview()
@@ -1750,6 +2049,8 @@ def launch_gui(initial_config=None):
         else:
             preview_disp = p_str
         lbl_payload_preview.config(text=f"Payload: {preview_disp}")
+        if 'lbl_wifi_payload_preview' in locals():
+            lbl_wifi_payload_preview.config(text=f"Payload: {preview_disp}")
         return payload_obj
 
     # Key bindings for preview updates
@@ -1937,30 +2238,28 @@ def launch_gui(initial_config=None):
 
         overall_matches, section_counts = search_across_all_sections(query)
 
-        # Update Section Buttons with Match Count Badges
-        for s_name, btn in sec_buttons.items():
-            bg_default, fg_default = section_colors.get(s_name, ("#f5f5f5", "#333"))
-            is_active_sec = (s_name == sec)
-            if query:
-                if s_name.startswith("8") or "ALL" in s_name.upper():
-                    s_count = len(overall_matches)
+        # Update Section Buttons with Match Count Badges on both Tab 1 and Tab 2
+        for btn_dict in (sec_buttons, wifi_sec_buttons):
+            for s_name, btn in btn_dict.items():
+                bg_default, fg_default = section_colors.get(s_name, ("#f5f5f5", "#333"))
+                is_active_sec = (s_name == sec)
+                if query:
+                    if s_name.startswith("8") or "ALL" in s_name.upper():
+                        s_count = len(overall_matches)
+                    else:
+                        s_count = section_counts.get(s_name, 0)
+                    btn.config(text=f"{s_name} ({s_count})")
+                    if s_count > 0:
+                        btn.config(bg="#fff9c4", fg="#f57f17", font=("Segoe UI", 9, "bold"))
+                    else:
+                        btn.config(bg=bg_default, fg="#9e9e9e", font=("Segoe UI", 9))
                 else:
-                    s_count = section_counts.get(s_name, 0)
-                btn.config(text=f"{s_name} ({s_count})")
-                if s_count > 0:
-                    btn.config(bg="#fff9c4", fg="#f57f17", font=("Segoe UI", 9, "bold"))
+                    btn.config(text=s_name, bg=bg_default, fg=fg_default, font=("Segoe UI", 9, "bold" if is_active_sec else "normal"))
+
+                if is_active_sec:
+                    btn.config(relief=tk.SUNKEN, bd=3)
                 else:
-                    btn.config(bg=bg_default, fg="#9e9e9e", font=("Segoe UI", 9))
-            else:
-                btn.config(text=s_name, bg=bg_default, fg=fg_default, font=("Segoe UI", 9, "bold" if is_active_sec else "normal"))
-
-            if is_active_sec:
-                btn.config(relief=tk.SUNKEN, bd=3)
-            else:
-                btn.config(relief=tk.RAISED, bd=1)
-
-        for item in tree_regs.get_children():
-            tree_regs.delete(item)
+                    btn.config(relief=tk.RAISED, bd=1)
 
         displayed = []
         if not sec.startswith("8") and "ALL" not in sec.upper():
@@ -1970,34 +2269,41 @@ def launch_gui(initial_config=None):
 
         displayed.sort(key=lambda x: x["address"])
 
-        for r in displayed:
-            val = r.get("value", "---")
-            ts = r.get("updated_at", "Never")
-            tag = "updated" if val != "---" else "normal"
-            item_iid = str(r["address"])
-            if tree_regs.exists(item_iid):
-                item_iid = f"{r['address']}_{r['name']}"
-            tree_regs.insert("", tk.END, iid=item_iid, values=(
-                r["address"],
-                r["name"],
-                r["category"],
-                val,
-                r.get("description", ""),
-                ts
-            ), tags=(tag,))
+        trees_to_update = [tree_regs]
+        if 'tree_wifi_regs' in locals() and tree_wifi_regs is not None:
+            trees_to_update.append(tree_wifi_regs)
 
-        # Auto-select the first register in the displayed list so entry below updates immediately!
-        children = tree_regs.get_children()
-        if children:
-            first_iid = children[0]
-            tree_regs.selection_set(first_iid)
-            tree_regs.focus(first_iid)
-            tree_regs.see(first_iid)
+        for tr in trees_to_update:
+            for item in tr.get_children():
+                tr.delete(item)
 
-        if query:
-            lbl_reg_count.config(text=f"Showing {len(displayed)} registers (Total {len(overall_matches)} matching '{query}')")
-        else:
-            lbl_reg_count.config(text=f"Showing {len(displayed)} / {len(REGISTER_CACHE)} registers in '{sec}'")
+            for r in displayed:
+                val = r.get("value", "---")
+                ts = r.get("updated_at", "Never")
+                tag = "updated" if val != "---" else "normal"
+                item_iid = str(r["address"])
+                if tr.exists(item_iid):
+                    item_iid = f"{r['address']}_{r['name']}"
+                tr.insert("", tk.END, iid=item_iid, values=(
+                    r["address"],
+                    r["name"],
+                    r["category"],
+                    val,
+                    r.get("description", ""),
+                    ts
+                ), tags=(tag,))
+
+            ch = tr.get_children()
+            if ch:
+                first_iid = ch[0]
+                tr.selection_set(first_iid)
+                tr.focus(first_iid)
+                tr.see(first_iid)
+
+        count_text = f"Showing {len(displayed)} registers (Total {len(overall_matches)} matching '{query}')" if query else f"Showing {len(displayed)} / {len(REGISTER_CACHE)} registers in '{sec}'"
+        lbl_reg_count.config(text=count_text)
+        if 'lbl_wifi_reg_count' in locals():
+            lbl_wifi_reg_count.config(text=count_text)
 
         update_selection_state()
 
@@ -2016,6 +2322,9 @@ def launch_gui(initial_config=None):
             lbl_pub_topic_info.config(text=f"Topic: {topic}  [{now_ts}]")
             disp_p = payload if len(payload) <= 90 else (payload[:87] + "...")
             lbl_pub_payload_info.config(text=f"Payload: {disp_p}")
+            if "WiFi" in topic and 'lbl_wifi_pub_info' in locals():
+                lbl_wifi_pub_info.config(text=f"Endpoint: {topic} [{now_ts}]")
+                lbl_wifi_pub_payload.config(text=f"Payload: {disp_p}")
         else:
             lat_txt = f" | Latency: {latency:.1f}ms" if latency is not None else ""
             entry_line = f"[{now_ts}] 📥 RECEIVED   <- {topic}{lat_txt} | Payload: {payload}"
@@ -2024,6 +2333,9 @@ def launch_gui(initial_config=None):
             lbl_recv_topic_info.config(text=f"Topic: {topic}  [{now_ts}{lat_txt}]")
             disp_p = payload if len(payload) <= 90 else (payload[:87] + "...")
             lbl_recv_payload_info.config(text=f"Payload: {disp_p}")
+            if "WiFi" in topic and 'lbl_wifi_recv_info' in locals():
+                lbl_wifi_recv_info.config(text=f"Status: Received [{now_ts}{lat_txt}]")
+                lbl_wifi_recv_payload.config(text=f"Data: {disp_p}")
 
     def log_topic_started_box(topic, action="PUBLISH", payload="", extra=""):
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -2184,9 +2496,22 @@ def launch_gui(initial_config=None):
         lbl_sub_status.config(text=f"[-] Unsubscribed from '{top}'", fg="#b71c1c")
         sync_and_save_state()
 
-    def do_auto_subscribe_all():
+    def set_dynamic_imei_topics(target_imei):
         nonlocal active_client
-        target_imei = entry_imei_dyn.get().strip() or broker_cfg.get("name", "866738083619898")
+        if not target_imei:
+            return
+        # Unsubscribe previous topics from broker if connected
+        if active_client and is_connected:
+            for old_t in list(subscribed_topics_map.keys()):
+                try:
+                    active_client.unsubscribe(old_t)
+                except Exception:
+                    pass
+
+        # Wipe out any and all topics from other IMEIs completely
+        subscribed_topics_map.clear()
+
+        # Build clean dynamic topics ONLY for the current active IMEI
         all_target_topics = [
             f"rtsg-1/ongridrooftop/{target_imei}/#",
             f"rtsg-1/ongridrooftop/{target_imei}/ondemand/pub",
@@ -2200,18 +2525,28 @@ def launch_gui(initial_config=None):
         for t in all_target_topics:
             subscribed_topics_map[t] = {"qos": 0, "packets": 0, "status": "Subscribed"}
             if active_client and is_connected:
-                active_client.subscribe(t, qos=0)
+                try:
+                    active_client.subscribe(t, qos=0)
+                except Exception:
+                    pass
+
         refresh_sub_treeview()
-        lbl_sub_status.config(text=f"[✓] Auto-subscribed all 8 topics for device '{target_imei}'!", fg="#0d47a1")
-        sync_and_save_state()
+        if 'lbl_sub_status' in locals():
+            lbl_sub_status.config(text=f"[✓] Dynamic Topic Filter updated for IMEI: {target_imei}", fg="#0d47a1")
+        try:
+            sync_and_save_state()
+        except (NameError, UnboundLocalError):
+            pass
+
+    def do_auto_subscribe_all():
+        target_imei = entry_imei_dyn.get().strip() or broker_cfg.get("name", "866738083623411")
+        set_dynamic_imei_topics(target_imei)
 
     btn_auto_sub.config(command=do_auto_subscribe_all)
 
-    # Initialize default subscriptions list
-    default_subs = current_config.get("topics", {}).get("info_subscriptions", [])
-    for ds in default_subs:
-        subscribed_topics_map[ds] = {"qos": 0, "packets": 0, "status": "Ready"}
-    refresh_sub_treeview()
+    # Initialize dynamic subscriptions for current active IMEI ONLY (removes all other IMEIs)
+    cur_init_imei = entry_imei_dyn.get().strip() or init_imei
+    set_dynamic_imei_topics(cur_init_imei)
 
     # -------------------------------------------------------------------------
     # TAB 2: LOCAL WIFI STATION (DEVICE DIRECT MODBUS & ONDEMAND FETCH)
@@ -2219,11 +2554,70 @@ def launch_gui(initial_config=None):
     tab_wifi = ttk.Frame(notebook)
     notebook.add(tab_wifi, text="  📶 Local WiFi Station  ")
 
-    paned_wifi = ttk.PanedWindow(tab_wifi, orient=tk.HORIZONTAL)
-    paned_wifi.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+    # =========================================================================
+    # CONTAINER 1: TOP FULL-WIDTH REGISTER SEARCHBAR & SECTION SELECTOR (WIFI)
+    # =========================================================================
+    f_wifi_top_container = ttk.LabelFrame(tab_wifi, text="1. Register Search Engine & Section Selector (Local WiFi Station)", padding=6)
+    f_wifi_top_container.pack(fill=tk.X, padx=8, pady=(2, 4))
 
-    # Left Container: Local Device WiFi Configuration & Network Ping Tester
-    f_wifi_left = ttk.LabelFrame(paned_wifi, text="1. Local WiFi Device Settings & Connection Test", padding=8)
+    sec_btn_frame_wifi = ttk.Frame(f_wifi_top_container)
+    sec_btn_frame_wifi.pack(fill=tk.X, pady=1)
+
+    for sec in SECTIONS:
+        bg_col, fg_col = section_colors.get(sec, ("#f5f5f5", "#333"))
+        is_cur = (sec == current_section.get())
+        b = tk.Button(
+            sec_btn_frame_wifi,
+            text=sec,
+            command=lambda s=sec: switch_section(s),
+            bg=bg_col,
+            fg=fg_col,
+            font=("Segoe UI", 9, "bold" if is_cur else "normal"),
+            relief=tk.SUNKEN if is_cur else tk.RAISED,
+            bd=3 if is_cur else 1,
+            padx=5,
+            pady=2
+        )
+        b.pack(side=tk.LEFT, padx=2, pady=1)
+        wifi_sec_buttons[sec] = b
+
+    # Search & Filter Toolbar for WiFi Tab
+    f_wifi_search = ttk.Frame(f_wifi_top_container)
+    f_wifi_search.pack(fill=tk.X, pady=(3, 1))
+
+    ttk.Label(f_wifi_search, text="🔍 Search Registers (Name/Addr/Function):", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(2, 6))
+    entry_wifi_reg_search = ttk.Entry(f_wifi_search, width=24, font=("Segoe UI", 9))
+    entry_wifi_reg_search.insert(0, saved_state.get("search_query", ""))
+    entry_wifi_reg_search.pack(side=tk.LEFT, padx=3)
+
+    chk_wifi_search_all = ttk.Checkbutton(f_wifi_search, text="Search Across All Sections (Show Badges)", variable=var_search_all)
+    chk_wifi_search_all.pack(side=tk.LEFT, padx=6)
+
+    def sync_search_wifi_to_main(*args):
+        q = entry_wifi_reg_search.get()
+        entry_reg_search.delete(0, tk.END)
+        entry_reg_search.insert(0, q)
+        apply_filter_regs()
+
+    entry_wifi_reg_search.bind("<KeyRelease>", sync_search_wifi_to_main)
+    chk_wifi_search_all.config(command=apply_filter_regs)
+
+    btn_wifi_clear_s = ttk.Button(f_wifi_search, text="Clear Search", command=lambda: (entry_wifi_reg_search.delete(0, tk.END), clear_search()))
+    btn_wifi_clear_s.pack(side=tk.LEFT, padx=3)
+
+    lbl_wifi_reg_count = ttk.Label(f_wifi_search, text="Showing 0 registers", font=("Segoe UI", 9, "italic"))
+    lbl_wifi_reg_count.pack(side=tk.RIGHT, padx=8)
+
+    # =========================================================================
+    # MAIN HORIZONTAL SPLIT (CONTAINER 2 LEFT ⇄ CONTAINER 3 RIGHT)
+    # =========================================================================
+    paned_wifi = ttk.PanedWindow(tab_wifi, orient=tk.HORIZONTAL)
+    paned_wifi.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 4))
+
+    # =========================================================================
+    # LEFT CONTAINER: WIFI CONNECTION SETTINGS & DIAGNOSTICS STREAM
+    # =========================================================================
+    f_wifi_left = ttk.LabelFrame(paned_wifi, text="2. Local Device WiFi Connection & Diagnostics", padding=8)
     paned_wifi.add(f_wifi_left, weight=2)
 
     ttk.Label(f_wifi_left, text="Local Device IP Address:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(2, 1))
@@ -2310,78 +2704,199 @@ def launch_gui(initial_config=None):
     lbl_wifi_ping_res.pack(fill=tk.X, pady=(4, 6))
 
     ttk.Label(f_wifi_left, text="WiFi Raw Communication Stream:", font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, pady=(4, 1))
-    txt_wifi_console = scrolledtext.ScrolledText(f_wifi_left, height=12, bg="#1e1e1e", fg="#00e676", font=("Consolas", 8))
+    txt_wifi_console = scrolledtext.ScrolledText(f_wifi_left, height=14, bg="#1e1e1e", fg="#00e676", font=("Consolas", 8))
     txt_wifi_console.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
 
     def log_wifi_console(text_msg):
         txt_wifi_console.insert(tk.END, text_msg)
         txt_wifi_console.see(tk.END)
 
-    # Right Container: Local Modbus Register Fetcher (Same-to-Same Searching)
-    f_wifi_right = ttk.LabelFrame(paned_wifi, text="2. Local Device Register Fetcher & Synchronized Modbus Explorer", padding=8)
+    # =========================================================================
+    # RIGHT CONTAINER: FULL SYNCHRONIZED REGISTER EXPLORER & DISPATCHER
+    # =========================================================================
+    f_wifi_right = ttk.LabelFrame(paned_wifi, text="3. Local Device Register Selector & Ondemand Dispatcher", padding=6)
     paned_wifi.add(f_wifi_right, weight=5)
 
-    f_wf_top_bar = ttk.Frame(f_wifi_right)
-    f_wf_top_bar.pack(fill=tk.X, pady=(0, 4))
+    # Register Table (Treeview) for WiFi Tab
+    reg_table_frame_wf = ttk.Frame(f_wifi_right)
+    reg_table_frame_wf.pack(fill=tk.BOTH, expand=True, pady=2)
 
-    ttk.Label(f_wf_top_bar, text="🔍 Search Registers:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
-    entry_wifi_reg_search = ttk.Entry(f_wf_top_bar, width=24, font=("Segoe UI", 9))
-    entry_wifi_reg_search.pack(side=tk.LEFT, padx=2)
+    tree_wifi_regs = ttk.Treeview(reg_table_frame_wf, columns=reg_cols, show="headings", selectmode="extended")
 
-    def sync_search_from_wifi(*args):
-        q = entry_wifi_reg_search.get()
-        entry_reg_search.delete(0, tk.END)
-        entry_reg_search.insert(0, q)
-        apply_filter_regs()
+    for col in reg_cols:
+        tree_wifi_regs.heading(col, text=tree_regs.heading(col, "text"), anchor=tree_regs.column(col, "anchor"))
+        tree_wifi_regs.column(col, width=tree_regs.column(col, "width"), anchor=tree_regs.column(col, "anchor"))
 
-    entry_wifi_reg_search.bind("<KeyRelease>", sync_search_from_wifi)
+    tree_wifi_regs.tag_configure("updated", background="#e8f5e9", foreground="#1b5e20")
+    tree_wifi_regs.tag_configure("normal", background="#ffffff")
 
-    ttk.Button(f_wf_top_bar, text="Clear", command=lambda: (entry_wifi_reg_search.delete(0, tk.END), sync_search_from_wifi())).pack(side=tk.LEFT, padx=3)
+    reg_scroll_y_wf = ttk.Scrollbar(reg_table_frame_wf, orient=tk.VERTICAL, command=tree_wifi_regs.yview)
+    tree_wifi_regs.configure(yscrollcommand=reg_scroll_y_wf.set)
+    tree_wifi_regs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    reg_scroll_y_wf.pack(side=tk.RIGHT, fill=tk.Y)
 
-    lbl_wifi_status_bar = tk.Label(
-        f_wifi_right,
-        text="Local WiFi Direct Mode: Queries device directly on LAN / AP without cloud broker.",
-        font=("Segoe UI", 8, "italic"),
-        fg="#1565c0",
-        anchor=tk.W
+    def on_wifi_tree_select(event=None):
+        sel = tree_wifi_regs.selection()
+        if sel:
+            tree_regs.selection_set(sel)
+            tree_regs.see(sel[0])
+            update_selection_state()
+
+    tree_wifi_regs.bind("<<TreeviewSelect>>", on_wifi_tree_select)
+    tree_wifi_regs.bind("<ButtonRelease-1>", on_wifi_tree_select)
+    tree_wifi_regs.bind("<KeyRelease-Up>", on_wifi_tree_select)
+    tree_wifi_regs.bind("<KeyRelease-Down>", on_wifi_tree_select)
+    tree_wifi_regs.bind("<Double-1>", lambda e: dispatch_wifi_fetch(batch=False))
+
+    # Selected Register Row: REG_NUMBER, VAL, CMKEY, PMKEY, cmd
+    wf_row1 = ttk.Frame(f_wifi_right)
+    wf_row1.pack(fill=tk.X, pady=2)
+
+    ttk.Label(wf_row1, text="REG_NUMBER:").pack(side=tk.LEFT, padx=(2, 2))
+    entry_wifi_reg_num_dyn = ttk.Entry(wf_row1, width=8, font=("Consolas", 9, "bold"))
+    entry_wifi_reg_num_dyn.insert(0, saved_state.get("last_reg_num", "3355"))
+    entry_wifi_reg_num_dyn.pack(side=tk.LEFT, padx=2)
+
+    lbl_wifi_reg_name_hint = tk.Label(wf_row1, text="[GPRS_S]", font=("Consolas", 8, "italic"), fg="#555")
+    lbl_wifi_reg_name_hint.pack(side=tk.LEFT, padx=(1, 4))
+
+    ttk.Label(wf_row1, text="VAL:").pack(side=tk.LEFT, padx=(4, 2))
+    entry_wifi_reg_val_dyn = ttk.Entry(wf_row1, width=7, font=("Consolas", 9, "bold"))
+    entry_wifi_reg_val_dyn.insert(0, saved_state.get("last_reg_val", "0"))
+    entry_wifi_reg_val_dyn.pack(side=tk.LEFT, padx=2)
+
+    ttk.Label(wf_row1, text="CMKEY:").pack(side=tk.LEFT, padx=(5, 2))
+    entry_wifi_cmkey_dyn = ttk.Entry(wf_row1, width=7, font=("Consolas", 9))
+    entry_wifi_cmkey_dyn.insert(0, saved_state.get("cmkey", LIVE_KEYS.get("CMKEY", "155521")))
+    entry_wifi_cmkey_dyn.pack(side=tk.LEFT, padx=2)
+
+    ttk.Label(wf_row1, text="PMKEY:").pack(side=tk.LEFT, padx=(5, 2))
+    entry_wifi_pmkey_dyn = ttk.Entry(wf_row1, width=7, font=("Consolas", 9))
+    entry_wifi_pmkey_dyn.insert(0, saved_state.get("pmkey", LIVE_KEYS.get("PMKEY", "438266")))
+    entry_wifi_pmkey_dyn.pack(side=tk.LEFT, padx=2)
+
+    ttk.Label(wf_row1, text="cmd:").pack(side=tk.LEFT, padx=(5, 2))
+    combo_wifi_cmd_dyn = ttk.Combobox(wf_row1, values=["read", "write"], width=5, state="readonly")
+    combo_wifi_cmd_dyn.set(saved_state.get("cmd", "read"))
+    combo_wifi_cmd_dyn.pack(side=tk.LEFT, padx=2)
+
+    def sync_wifi_inputs_to_main(*args):
+        entry_reg_num_dyn.delete(0, tk.END)
+        entry_reg_num_dyn.insert(0, entry_wifi_reg_num_dyn.get().strip())
+        entry_reg_val_dyn.delete(0, tk.END)
+        entry_reg_val_dyn.insert(0, entry_wifi_reg_val_dyn.get().strip())
+        entry_cmkey_dyn.delete(0, tk.END)
+        entry_cmkey_dyn.insert(0, entry_wifi_cmkey_dyn.get().strip())
+        entry_pmkey_dyn.delete(0, tk.END)
+        entry_pmkey_dyn.insert(0, entry_wifi_pmkey_dyn.get().strip())
+        combo_cmd_dyn.set(combo_wifi_cmd_dyn.get().strip())
+        update_payload_preview()
+
+    entry_wifi_reg_num_dyn.bind("<KeyRelease>", sync_wifi_inputs_to_main)
+    entry_wifi_reg_val_dyn.bind("<KeyRelease>", sync_wifi_inputs_to_main)
+    entry_wifi_cmkey_dyn.bind("<KeyRelease>", sync_wifi_inputs_to_main)
+    entry_wifi_pmkey_dyn.bind("<KeyRelease>", sync_wifi_inputs_to_main)
+    combo_wifi_cmd_dyn.bind("<<ComboboxSelected>>", sync_wifi_inputs_to_main)
+
+    # Batch selection toolbar for WiFi
+    wf_batch_row = ttk.Frame(f_wifi_right)
+    wf_batch_row.pack(fill=tk.X, pady=1)
+
+    def select_all_wifi_visible():
+        all_items = tree_wifi_regs.get_children()
+        tree_wifi_regs.selection_set(all_items)
+        tree_regs.selection_set(all_items)
+        update_selection_state()
+
+    def clear_wifi_selection():
+        tree_wifi_regs.selection_remove(tree_wifi_regs.selection())
+        tree_regs.selection_remove(tree_regs.selection())
+        update_selection_state()
+
+    ttk.Button(wf_batch_row, text="🗹 Select All Visible", command=select_all_wifi_visible).pack(side=tk.LEFT, padx=2)
+    ttk.Button(wf_batch_row, text="☐ Clear Selection", command=clear_wifi_selection).pack(side=tk.LEFT, padx=2)
+
+    lbl_wifi_selection_count = ttk.Label(wf_batch_row, text="0 registers selected for batch", font=("Segoe UI", 8, "bold"), foreground="#1565c0")
+    lbl_wifi_selection_count.pack(side=tk.LEFT, padx=8)
+
+    # Selected Payload Preview (Box) for WiFi
+    wf_prev_row = ttk.Frame(f_wifi_right)
+    wf_prev_row.pack(fill=tk.X, pady=(3, 2))
+
+    lbl_wifi_payload_preview = tk.Label(
+        wf_prev_row,
+        text='Payload: {"msgid":"...","CMKEY":"...","PMKEY":"...","type":"ondemand","cmd":"read","3355":0}',
+        fg="#0d47a1",
+        bg="#e8eaf6",
+        font=("Consolas", 8),
+        anchor=tk.W,
+        relief=tk.SOLID,
+        bd=1,
+        padx=6,
+        pady=3
     )
-    lbl_wifi_status_bar.pack(fill=tk.X, pady=(1, 3))
+    lbl_wifi_payload_preview.pack(fill=tk.X, expand=True)
 
-    f_wf_act_row = ttk.Frame(f_wifi_right)
-    f_wf_act_row.pack(fill=tk.X, pady=(2, 4))
+    # Action Toolbar: DIRECTLY BELOW THE SELECTED PAYLOAD
+    wf_action_row = ttk.Frame(f_wifi_right)
+    wf_action_row.pack(fill=tk.X, pady=(3, 2))
 
     btn_wifi_fetch_single = tk.Button(
-        f_wf_act_row,
+        wf_action_row,
         text="🚀 FETCH LOCAL DEVICE VIA WIFI (SINGLE)",
         command=lambda: dispatch_wifi_fetch(batch=False),
         font=("Segoe UI", 9, "bold"),
-        bg="#2e7d32",
+        bg="#28a745",
         fg="white",
+        relief=tk.RAISED,
+        bd=2,
         padx=10,
-        pady=5
+        pady=4
     )
     btn_wifi_fetch_single.pack(side=tk.LEFT, padx=3)
 
     btn_wifi_fetch_batch = tk.Button(
-        f_wf_act_row,
+        wf_action_row,
         text="📦 BATCH FETCH VIA WIFI (ALL SELECTED)",
         command=lambda: dispatch_wifi_fetch(batch=True),
         font=("Segoe UI", 9, "bold"),
-        bg="#00695c",
+        bg="#0d47a1",
         fg="white",
+        relief=tk.RAISED,
+        bd=2,
         padx=10,
-        pady=5
+        pady=4
     )
     btn_wifi_fetch_batch.pack(side=tk.LEFT, padx=3)
 
-    ttk.Label(
+    lbl_wifi_fetch_status = tk.Label(
         f_wifi_right,
-        text="💡 Tip: Fetched values automatically update the main Register Explorer, Telemetry Monitor, and database cache.",
+        text="Select register(s) from table, then click 'FETCH LOCAL DEVICE' to query over LAN / AP.",
+        fg="#616161",
         font=("Segoe UI", 8),
-        foreground="#616161"
-    ).pack(anchor=tk.W, pady=2)
+        anchor=tk.W
+    )
+    lbl_wifi_fetch_status.pack(fill=tk.X, pady=(1, 2))
 
-    # -------------------------------------------------------------------------
+    # Last Published Card in Container 2 (WiFi)
+    card_wifi_pub = tk.Frame(f_wifi_right, bg="#e3f2fd", relief=tk.SOLID, bd=1, padx=6, pady=3)
+    card_wifi_pub.pack(fill=tk.X, pady=(2, 1))
+
+    tk.Label(card_wifi_pub, text="📤 LAST PUBLISHED / DISPATCHED (WIFI):", font=("Segoe UI", 8, "bold"), bg="#e3f2fd", fg="#0d47a1").pack(anchor=tk.W)
+    lbl_wifi_pub_info = tk.Label(card_wifi_pub, text="Endpoint: (None yet)", font=("Consolas", 8, "bold"), bg="#e3f2fd", fg="#1565c0", anchor=tk.W)
+    lbl_wifi_pub_info.pack(fill=tk.X)
+    lbl_wifi_pub_payload = tk.Label(card_wifi_pub, text="Payload: (None)", font=("Consolas", 8), bg="#e3f2fd", fg="#333", anchor=tk.W)
+    lbl_wifi_pub_payload.pack(fill=tk.X)
+
+    card_wifi_recv = tk.Frame(f_wifi_right, bg="#e8f5e9", relief=tk.SOLID, bd=1, padx=6, pady=3)
+    card_wifi_recv.pack(fill=tk.X, pady=(1, 2))
+
+    tk.Label(card_wifi_recv, text="📥 LAST RECEIVED / WIFI RESPONSE:", font=("Segoe UI", 8, "bold"), bg="#e8f5e9", fg="#1b5e20").pack(anchor=tk.W)
+    lbl_wifi_recv_info = tk.Label(card_wifi_recv, text="Status: (Awaiting query)", font=("Consolas", 8, "bold"), bg="#e8f5e9", fg="#2e7d32", anchor=tk.W)
+    lbl_wifi_recv_info.pack(fill=tk.X)
+    lbl_wifi_recv_payload = tk.Label(card_wifi_recv, text="Data: (None)", font=("Consolas", 8), bg="#e8f5e9", fg="#333", anchor=tk.W)
+    lbl_wifi_recv_payload.pack(fill=tk.X)
+
     # TAB 3: ADVANCED PUBLISH & PAYLOAD STUDIO
     # -------------------------------------------------------------------------
     tab_topics = ttk.Frame(notebook)
@@ -2448,11 +2963,11 @@ def launch_gui(initial_config=None):
 
     def insert_trigger_text():
         txt_custom_payload.delete("1.0", tk.END)
-        txt_custom_payload.insert(tk.END, "asas")
+        txt_custom_payload.insert(tk.END, '{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}')
 
     ttk.Button(f_payload_helpers, text="Insert Single JSON", command=insert_single_json).pack(side=tk.LEFT, padx=3)
     ttk.Button(f_payload_helpers, text="Insert Batch JSON", command=insert_batch_json).pack(side=tk.LEFT, padx=3)
-    ttk.Button(f_payload_helpers, text='Insert Trigger ("asas")', command=insert_trigger_text).pack(side=tk.LEFT, padx=3)
+    ttk.Button(f_payload_helpers, text='Insert Ondemand Trigger JSON', command=insert_trigger_text).pack(side=tk.LEFT, padx=3)
 
     def dispatch_custom_publish():
         nonlocal active_client, is_connected, last_dispatch_meta
@@ -2670,7 +3185,7 @@ def launch_gui(initial_config=None):
             "cmd": combo_cmd_dyn.get().strip(),
             "publish_topic": entry_pub_topic_tab1.get().strip(),
             "subscribe_topic": entry_sub_topic_tab1.get().strip(),
-            "subscribed_topics": list(subscribed_topics_map.keys()),
+            "subscribed_topics": [t for t in subscribed_topics_map.keys() if (not entry_imei_dyn.get().strip() or entry_imei_dyn.get().strip() in t)],
             "cached_register_values": cache_snapshot,
             "wifi_device_ip": entry_wifi_ip.get().strip() if 'entry_wifi_ip' in locals() else saved_state.get("wifi_device_ip", "192.168.4.1"),
             "wifi_device_port": int(entry_wifi_port.get().strip() or 80) if 'entry_wifi_port' in locals() else saved_state.get("wifi_device_port", 80),
@@ -2732,6 +3247,7 @@ def launch_gui(initial_config=None):
     # Initial data render
     apply_filter_regs()
     update_payload_preview()
+    sync_and_save_state()
 
     root.mainloop()
 
@@ -2952,7 +3468,7 @@ def enter_new_connection_action():
             "auto_poll": False,
             "poll_interval_seconds": 15,
             "response_timeout_seconds": 30,
-            "payload_to_send": "asas",
+            "payload_to_send": '{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}',
             "target_imei_only": True,
             "rtevent_display_mode": "compact"
         },

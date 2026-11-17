@@ -34,25 +34,25 @@ topics:
   rtevent_pub_template: "rtsg-1/ongridrooftop/{imei}/rtevent/pub"
 
   # Subscriptions: Subscribes to ALL topics for THIS device via wildcard suffix #
-  # This guarantees 100% of packets from 866738083619898 are received, exactly like in MQTTBox!
+  # This guarantees 100% of packets from the active device are received, exactly like in MQTTBox!
   info_subscriptions:
-    - "rtsg-1/ongridrooftop/866738083619898/#"
-    - "rtsg-1/ongridrooftop/866738083619898/ondemand/pub"
-    - "rtsg-1/ongridrooftop/866738083619898/data/pub"
-    - "rtsg-1/ongridrooftop/866738083619898/heartbeat/pub"
-    - "rtsg-1/ongridrooftop/866738083619898/config/pub"
-    - "rtsg-1/ongridrooftop/866738083619898/rtevent/pub"
-    - "rtsg-1/ongridrooftop/866738083619898/ondemand/sub"
-    - "rtsg-1/ongridrooftop/866738083619898/config/sub"
-    - "rtsg-1/ongridrooftop/866738083619898/messagekey/sub"
-    - "rtsg-1/ongridrooftop/866738083619898/info/sub"
+    - "rtsg-1/ongridrooftop/{imei}/#"
+    - "rtsg-1/ongridrooftop/{imei}/ondemand/pub"
+    - "rtsg-1/ongridrooftop/{imei}/data/pub"
+    - "rtsg-1/ongridrooftop/{imei}/heartbeat/pub"
+    - "rtsg-1/ongridrooftop/{imei}/config/pub"
+    - "rtsg-1/ongridrooftop/{imei}/rtevent/pub"
+    - "rtsg-1/ongridrooftop/{imei}/ondemand/sub"
+    - "rtsg-1/ongridrooftop/{imei}/config/sub"
+    - "rtsg-1/ongridrooftop/{imei}/messagekey/sub"
+    - "rtsg-1/ongridrooftop/{imei}/info/sub"
 
 settings:
   auto_poll: false                         # Set true to automatically poll every N seconds
   poll_interval_seconds: 15
   response_timeout_seconds: 30
-  payload_to_send: "asas"
-  auto_reply_messagekey: true              # Automatically send ondemand request 'asas' when device messagekey arrives!
+  payload_to_send: '{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}'
+  auto_reply_messagekey: true              # Automatically send ondemand request JSON when device messagekey arrives!
   target_imei_only: true                   # Only process & print target IMEI (filters out other devices)
   rtevent_display_mode: "compact"          # "compact" = 1-line clean summary, "full" = multiline box, "silent" = no console print
 

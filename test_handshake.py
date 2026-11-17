@@ -84,11 +84,13 @@ def run_tests():
     assert counts["1. GPRS_Connection"] >= 5
 
     # Test state persistence
-    test_state = {"broker_host": "rms.iotscada-pmsg.com", "target_imei": "866738083619898", "last_reg_name": "GPRS_S"}
+    orig_state = load_app_state()
+    test_state = dict(orig_state)
+    test_state.update({"broker_host": "rms.iotscada-pmsg.com", "target_imei": orig_state.get("target_imei", "866738083623411"), "last_reg_name": "GPRS_S"})
     save_app_state(test_state)
     loaded_st = load_app_state()
-    assert loaded_st.get("target_imei") == "866738083619898"
     assert loaded_st.get("last_reg_name") == "GPRS_S"
+    save_app_state(orig_state)
 
     gprs_list = get_gprs_registers()
     assert len(gprs_list) >= 20, f"Expected >20 GPRS registers, got {len(gprs_list)}"

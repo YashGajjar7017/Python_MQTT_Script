@@ -29,28 +29,24 @@
     <rtevent_pub_template>rtsg-1/ongridrooftop/{imei}/rtevent/pub</rtevent_pub_template>
 
     <info_subscriptions>
-      <topic>rtsg-1/ongridrooftop/866738083619898/data/pub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/heartbeat/pub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/ondemand/pub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/config/pub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/ondemand/sub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/config/sub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/messagekey/sub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/info/sub</topic>
-      <topic>rtsg-1/ongridrooftop/866738083619898/rtevent/pub</topic>
-      <topic>rtsg-1/ongridrooftop/+/data/pub</topic>
-      <topic>rtsg-1/ongridrooftop/+/heartbeat/pub</topic>
-      <topic>rtsg-1/ongridrooftop/+/ondemand/pub</topic>
-      <topic>rtsg-1/ongridrooftop/+/config/pub</topic>
-      <topic>rtsg-1/ongridrooftop/+/rtevent/pub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/#</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/ondemand/pub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/data/pub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/heartbeat/pub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/config/pub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/rtevent/pub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/ondemand/sub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/config/sub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/messagekey/sub</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/info/sub</topic>
     </info_subscriptions>
   </topics>
 
   <settings>
-    <auto_poll>true</auto_poll>
+    <auto_poll>false</auto_poll>
     <poll_interval_seconds>15</poll_interval_seconds>
     <response_timeout_seconds>30</response_timeout_seconds>
-    <payload_to_send>asas</payload_to_send>
+    <payload_to_send>{"msgid":"6374196","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}</payload_to_send>
   </settings>
 
   <registered_devices>
