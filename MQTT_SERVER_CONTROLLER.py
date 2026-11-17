@@ -20,12 +20,16 @@ import os
 import time
 import json
 import ssl
+import socket
 import csv
 import glob
 import random
 import argparse
 import getpass
 import threading
+import urllib.request
+import urllib.error
+import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -220,6 +224,124 @@ def get_saved_password(host, username="", port=8883):
     if host in creds and creds[host].get("password"):
         return creds[host]["password"]
     return ""
+
+
+# ==============================================================================
+#                  LOCAL WIFI DEVICE CONTROLLER (DIRECT LAN / AP)
+# ==============================================================================
+
+def ping_local_wifi_device(ip, port, timeout=2.0):
+    """Pings/tests TCP connectivity to a local WiFi device (e.g. ESP32/Modbus gateway)."""
+    t0 = time.time()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, int(port)))
+        s.close()
+        rtt_ms = round((time.time() - t0) * 1000.0, 1)
+        return True, rtt_ms, f"Connected ({rtt_ms} ms)"
+    except Exception as e:
+        rtt_ms = round((time.time() - t0) * 1000.0, 1)
+        return False, rtt_ms, str(e)
+
+
+def query_local_wifi_device(ip, port, protocol, payload_dict, timeout=3.5):
+    """
+    Dispatches ondemand register query to a local WiFi device via HTTP POST, HTTP GET, or TCP Socket.
+    Returns: (success: bool, response_dict: dict, raw_text: str, rtt_ms: float, error_msg: str)
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    t0 = time.time()
+    payload_json = json.dumps(payload_dict)
+    proto_up = protocol.upper()
+
+    if "POST" in proto_up:
+        # Standard HTTP POST /ondemand
+        url = f"http://{ip}:{port}/ondemand"
+        req = urllib.request.Request(
+            url,
+            data=payload_json.encode('utf-8'),
+            headers={'Content-Type': 'application/json', 'User-Agent': 'MQTT-SCADA-Controller/2.0'},
+            method='POST'
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw_bytes = resp.read()
+                raw_text = raw_bytes.decode('utf-8', errors='replace')
+                rtt_ms = round((time.time() - t0) * 1000.0, 1)
+                try:
+                    data = json.loads(raw_text)
+                    return True, data, raw_text, rtt_ms, ""
+                except json.JSONDecodeError:
+                    return True, {}, raw_text, rtt_ms, "Non-JSON response"
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                try:
+                    url_root = f"http://{ip}:{port}/"
+                    req2 = urllib.request.Request(
+                        url_root,
+                        data=payload_json.encode('utf-8'),
+                        headers={'Content-Type': 'application/json'},
+                        method='POST'
+                    )
+                    with urllib.request.urlopen(req2, timeout=timeout) as resp2:
+                        raw_bytes = resp2.read()
+                        raw_text = raw_bytes.decode('utf-8', errors='replace')
+                        rtt_ms = round((time.time() - t0) * 1000.0, 1)
+                        try:
+                            data = json.loads(raw_text)
+                            return True, data, raw_text, rtt_ms, ""
+                        except json.JSONDecodeError:
+                            return True, {}, raw_text, rtt_ms, ""
+                except Exception:
+                    pass
+            rtt_ms = round((time.time() - t0) * 1000.0, 1)
+            return False, {}, str(e), rtt_ms, f"HTTP Error {e.code}: {e.reason}"
+        except Exception as e:
+            rtt_ms = round((time.time() - t0) * 1000.0, 1)
+            return False, {}, "", rtt_ms, str(e)
+
+    elif "GET" in proto_up:
+        # HTTP GET /ondemand with query parameters
+        params = [f"{k}={urllib.parse.quote(str(v))}" for k, v in payload_dict.items()]
+        query_str = "&".join(params)
+        url = f"http://{ip}:{port}/ondemand?{query_str}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'MQTT-SCADA-Controller/2.0'}, method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw_bytes = resp.read()
+                raw_text = raw_bytes.decode('utf-8', errors='replace')
+                rtt_ms = round((time.time() - t0) * 1000.0, 1)
+                try:
+                    data = json.loads(raw_text)
+                    return True, data, raw_text, rtt_ms, ""
+                except json.JSONDecodeError:
+                    return True, {}, raw_text, rtt_ms, ""
+        except Exception as e:
+            rtt_ms = round((time.time() - t0) * 1000.0, 1)
+            return False, {}, "", rtt_ms, str(e)
+
+    else:
+        # TCP Direct Socket (JSON)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, int(port)))
+            s.sendall((payload_json + "\n").encode('utf-8'))
+            resp_bytes = s.recv(4096)
+            s.close()
+            rtt_ms = round((time.time() - t0) * 1000.0, 1)
+            raw_text = resp_bytes.decode('utf-8', errors='replace')
+            try:
+                data = json.loads(raw_text.strip())
+                return True, data, raw_text, rtt_ms, ""
+            except json.JSONDecodeError:
+                return True, {}, raw_text, rtt_ms, ""
+        except Exception as e:
+            rtt_ms = round((time.time() - t0) * 1000.0, 1)
+            return False, {}, "", rtt_ms, str(e)
 
 
 # ==============================================================================
@@ -917,6 +1039,42 @@ def run_live_client(config, once=False, cli_password=None, on_message_callback=N
 
 
 # ==============================================================================
+#                  BOXED TOPIC TRANSACTION LOGGER (START & OVER FRAMING)
+# ==============================================================================
+
+def format_boxed_log(header_title, fields_dict, width=82):
+    """Generates a clean ascii/unicode framing box for topic transactions."""
+    top_border = f"╔{'═' * (width - 2)}╗"
+    mid_border = f"╟{'─' * (width - 2)}╢"
+    bot_border = f"╚{'═' * (width - 2)}╝"
+
+    lines = [top_border]
+    hdr_content = f" {header_title} "
+    lines.append(f"║{hdr_content.center(width - 2)}║")
+    lines.append(mid_border)
+
+    for key, val in fields_dict.items():
+        val_str = str(val)
+        prefix = f"║  • {key:<14}: "
+        avail = width - len(prefix) - 2
+        if len(val_str) <= avail:
+            lines.append(f"{prefix}{val_str.ljust(avail)} ║")
+        else:
+            first_part = val_str[:avail]
+            lines.append(f"{prefix}{first_part} ║")
+            rest = val_str[avail:]
+            indent = f"║    {' ' * 14}  "
+            ind_avail = width - len(indent) - 2
+            while rest:
+                chunk = rest[:ind_avail]
+                lines.append(f"{indent}{chunk.ljust(ind_avail)} ║")
+                rest = rest[ind_avail:]
+
+    lines.append(bot_border)
+    return "\n".join(lines)
+
+
+# ==============================================================================
 #                  TKINTER GUI APPLICATION WITH ONDEMAND BUTTON & VIEWER
 # ==============================================================================
 
@@ -934,8 +1092,11 @@ def launch_gui(initial_config=None):
 
     root = tk.Tk()
     root.title("MQTT SCADA & Ondemand Controller")
-    root.geometry("1180x820")
-    root.minsize(980, 680)
+    try:
+        root.state("zoomed")
+    except Exception:
+        root.geometry("1400x900")
+    root.minsize(1080, 700)
 
     style = ttk.Style()
     style.theme_use("clam")
@@ -1020,17 +1181,19 @@ def launch_gui(initial_config=None):
     notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
     # -------------------------------------------------------------------------
-    # TAB 1: MODBUS & GPRS REGISTER EXPLORER (SECTIONS & DYNAMIC ONDEMAND FETCH)
+    # TAB 1: MODBUS & GPRS REGISTER EXPLORER (3-CONTAINER UNIFIED SCADA CONTROL)
     # -------------------------------------------------------------------------
     tab_regs = ttk.Frame(notebook)
     notebook.add(tab_regs, text="  🔌 Modbus & GPRS Register Explorer  ")
 
-    # Section 1 Header: Direct Partition Selector
-    f_sections = ttk.LabelFrame(tab_regs, text="1. Select Modbus Register Section / Partition (Dynamic Match Counts)", padding=6)
-    f_sections.pack(fill=tk.X, padx=10, pady=2)
+    # =========================================================================
+    # CONTAINER 1: TOP FULL-WIDTH REGISTER SEARCHBAR & SECTION SELECTOR
+    # =========================================================================
+    f_top_container = ttk.LabelFrame(tab_regs, text="1. Register Search Engine & Section Selector (Full-Width)", padding=6)
+    f_top_container.pack(fill=tk.X, padx=8, pady=(2, 4))
 
-    sec_btn_frame = ttk.Frame(f_sections)
-    sec_btn_frame.pack(fill=tk.X, pady=2)
+    sec_btn_frame = ttk.Frame(f_top_container)
+    sec_btn_frame.pack(fill=tk.X, pady=1)
 
     section_colors = {
         "1. GPRS_Connection": ("#e3f2fd", "#0d47a1"),
@@ -1047,6 +1210,10 @@ def launch_gui(initial_config=None):
 
     def switch_section(sec_name):
         current_section.set(sec_name)
+        if sec_name.startswith("8") or "ALL" in sec_name.upper():
+            var_search_all.set(True)
+        else:
+            var_search_all.set(False)
         for name, btn in sec_buttons.items():
             if name == sec_name:
                 btn.config(relief=tk.SUNKEN, bd=3)
@@ -1067,14 +1234,14 @@ def launch_gui(initial_config=None):
             relief=tk.SUNKEN if is_cur else tk.RAISED,
             bd=3 if is_cur else 1,
             padx=5,
-            pady=3
+            pady=2
         )
-        b.pack(side=tk.LEFT, padx=2, pady=2)
+        b.pack(side=tk.LEFT, padx=2, pady=1)
         sec_buttons[sec] = b
 
     # Search & Filter Toolbar
-    f_search = ttk.Frame(f_sections)
-    f_search.pack(fill=tk.X, pady=(4, 2))
+    f_search = ttk.Frame(f_top_container)
+    f_search.pack(fill=tk.X, pady=(3, 1))
 
     ttk.Label(f_search, text="🔍 Search Registers (Name/Addr/Function):", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(2, 6))
     entry_reg_search = ttk.Entry(f_search, width=24, font=("Segoe UI", 9))
@@ -1095,53 +1262,31 @@ def launch_gui(initial_config=None):
     lbl_reg_count = ttk.Label(f_search, text="Showing 0 registers", font=("Segoe UI", 9, "italic"))
     lbl_reg_count.pack(side=tk.RIGHT, padx=8)
 
-    # -------------------------------------------------------------------------
-    # DYNAMIC ONDEMAND PAYLOAD BUILDER & BATCH CONTROLS (WITH PUB/SUB INPUTS)
-    # -------------------------------------------------------------------------
-    f_payload = ttk.LabelFrame(tab_regs, text="2. Dynamic Ondemand Device Command (Exact SCADA JSON Dispatcher)", padding=6)
-    f_payload.pack(fill=tk.X, padx=10, pady=2)
+    # =========================================================================
+    # MAIN HORIZONTAL SPLIT (CONTAINER 2 LEFT ⇄ CONTAINER 3 RIGHT)
+    # =========================================================================
+    paned_main = ttk.PanedWindow(tab_regs, orient=tk.HORIZONTAL)
+    paned_main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 4))
 
-    # Row 0: Target IMEI, Publish Topic & Subscribe Topic directly in Tab 1
-    p_top_row = ttk.Frame(f_payload)
-    p_top_row.pack(fill=tk.X, pady=(1, 3))
+    # =========================================================================
+    # CONTAINER 2: LEFT PANE - PUBLISH TOPIC, REGISTERS & PAYLOAD DISPATCH
+    # =========================================================================
+    f_left_container = ttk.LabelFrame(paned_main, text="2. Outgoing Command & Register Selector (Publish)", padding=6)
+    paned_main.add(f_left_container, weight=3)
 
-    ttk.Label(p_top_row, text="Target IMEI:").pack(side=tk.LEFT, padx=3)
-    entry_imei_dyn = ttk.Entry(p_top_row, width=17)
+    # Row 0: Target IMEI & Publish Topic
+    p_pub_header = ttk.Frame(f_left_container)
+    p_pub_header.pack(fill=tk.X, pady=(1, 3))
+
+    ttk.Label(p_pub_header, text="Target IMEI:").pack(side=tk.LEFT, padx=2)
+    entry_imei_dyn = ttk.Entry(p_pub_header, width=17)
     entry_imei_dyn.insert(0, init_imei)
-    entry_imei_dyn.pack(side=tk.LEFT, padx=3)
+    entry_imei_dyn.pack(side=tk.LEFT, padx=2)
 
-    ttk.Label(p_top_row, text="Publish Topic:").pack(side=tk.LEFT, padx=(6, 2))
-    entry_pub_topic_tab1 = ttk.Entry(p_top_row, width=32, font=("Consolas", 8))
+    ttk.Label(p_pub_header, text="Publish Topic:").pack(side=tk.LEFT, padx=(6, 2))
+    entry_pub_topic_tab1 = ttk.Entry(p_pub_header, width=38, font=("Consolas", 8))
     entry_pub_topic_tab1.insert(0, saved_state.get("publish_topic", f"rtsg-1/ongridrooftop/{init_imei}/ondemand/sub"))
-    entry_pub_topic_tab1.pack(side=tk.LEFT, padx=2)
-
-    ttk.Label(p_top_row, text="Subscribe Topic:").pack(side=tk.LEFT, padx=(6, 2))
-    entry_sub_topic_tab1 = ttk.Entry(p_top_row, width=30, font=("Consolas", 8))
-    entry_sub_topic_tab1.insert(0, saved_state.get("subscribe_topic", f"rtsg-1/ongridrooftop/{init_imei}/#"))
-    entry_sub_topic_tab1.pack(side=tk.LEFT, padx=2)
-
-    def quick_sub_tab1():
-        top = entry_sub_topic_tab1.get().strip()
-        if top:
-            subscribed_topics_map[top] = {"qos": 0, "packets": 0, "status": "Subscribed"}
-            if active_client and is_connected:
-                active_client.subscribe(top, qos=0)
-            refresh_sub_treeview()
-            lbl_fetch_status.config(text=f"[✓] Subscribed to '{top}' successfully!", fg="#0d47a1")
-            sync_and_save_state()
-
-    btn_quick_sub = tk.Button(
-        p_top_row,
-        text="⚡ Sub",
-        command=quick_sub_tab1,
-        font=("Segoe UI", 8, "bold"),
-        bg="#007bff",
-        fg="white",
-        relief=tk.RAISED,
-        bd=1,
-        padx=5
-    )
-    btn_quick_sub.pack(side=tk.LEFT, padx=2)
+    entry_pub_topic_tab1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
     def on_imei_changed(*args):
         imei_val = entry_imei_dyn.get().strip()
@@ -1154,41 +1299,89 @@ def launch_gui(initial_config=None):
 
     entry_imei_dyn.bind("<KeyRelease>", on_imei_changed)
 
-    # Row 1: REG_NUMBER (Modbus Addr), VAL, CMKEY, PMKEY, cmd
-    p_row1 = ttk.Frame(f_payload)
+    # Row 0.5: Transport Mode Selector (Cloud MQTT Broker vs Local WiFi Direct)
+    p_transport_header = ttk.Frame(f_left_container)
+    p_transport_header.pack(fill=tk.X, pady=(1, 3))
+
+    ttk.Label(p_transport_header, text="Channel:").pack(side=tk.LEFT, padx=(2, 2))
+    var_transport_mode = tk.StringVar(value=saved_state.get("transport_mode", "mqtt"))
+    rb_mqtt = ttk.Radiobutton(p_transport_header, text="Cloud MQTT Broker", variable=var_transport_mode, value="mqtt")
+    rb_mqtt.pack(side=tk.LEFT, padx=3)
+    rb_wifi = ttk.Radiobutton(p_transport_header, text="📶 Local WiFi Direct", variable=var_transport_mode, value="wifi")
+    rb_wifi.pack(side=tk.LEFT, padx=3)
+
+    lbl_wifi_quick_info = ttk.Label(
+        p_transport_header,
+        text=f"(Target: {saved_state.get('wifi_device_ip', '192.168.4.1')}:{saved_state.get('wifi_device_port', 80)})",
+        font=("Consolas", 8, "italic"),
+        foreground="#0d47a1"
+    )
+    lbl_wifi_quick_info.pack(side=tk.LEFT, padx=4)
+
+    # Register Table (Treeview)
+    reg_table_frame = ttk.Frame(f_left_container)
+    reg_table_frame.pack(fill=tk.BOTH, expand=True, pady=2)
+
+    reg_cols = ("Address", "Register Name", "Section / Category", "Current Value", "Description", "Last Updated")
+    tree_regs = ttk.Treeview(reg_table_frame, columns=reg_cols, show="headings", selectmode="extended")
+
+    tree_regs.heading("Address", text="Modbus Addr", anchor=tk.CENTER)
+    tree_regs.heading("Register Name", text="Register Name", anchor=tk.W)
+    tree_regs.heading("Section / Category", text="Section / Category", anchor=tk.CENTER)
+    tree_regs.heading("Current Value", text="Current Value (Live)", anchor=tk.CENTER)
+    tree_regs.heading("Description", text="Description / Firmware Function", anchor=tk.W)
+    tree_regs.heading("Last Updated", text="Last Updated", anchor=tk.CENTER)
+
+    tree_regs.column("Address", width=85, anchor=tk.CENTER)
+    tree_regs.column("Register Name", width=170, anchor=tk.W)
+    tree_regs.column("Section / Category", width=130, anchor=tk.CENTER)
+    tree_regs.column("Current Value", width=120, anchor=tk.CENTER)
+    tree_regs.column("Description", width=250, anchor=tk.W)
+    tree_regs.column("Last Updated", width=105, anchor=tk.CENTER)
+
+    tree_regs.tag_configure("updated", background="#e8f5e9", foreground="#1b5e20")
+    tree_regs.tag_configure("normal", background="#ffffff")
+
+    reg_scroll_y = ttk.Scrollbar(reg_table_frame, orient=tk.VERTICAL, command=tree_regs.yview)
+    tree_regs.configure(yscrollcommand=reg_scroll_y.set)
+    tree_regs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    reg_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # Selected Register Row: REG_NUMBER, VAL, CMKEY, PMKEY, cmd
+    p_row1 = ttk.Frame(f_left_container)
     p_row1.pack(fill=tk.X, pady=2)
 
-    ttk.Label(p_row1, text="REG_NUMBER (Addr):").pack(side=tk.LEFT, padx=(2, 2))
-    entry_reg_num_dyn = ttk.Entry(p_row1, width=9, font=("Consolas", 9, "bold"))
-    entry_reg_num_dyn.insert(0, saved_state.get("last_reg_num", "3354"))
+    ttk.Label(p_row1, text="REG_NUMBER:").pack(side=tk.LEFT, padx=(2, 2))
+    entry_reg_num_dyn = ttk.Entry(p_row1, width=8, font=("Consolas", 9, "bold"))
+    entry_reg_num_dyn.insert(0, saved_state.get("last_reg_num", "3355"))
     entry_reg_num_dyn.pack(side=tk.LEFT, padx=2)
 
     lbl_reg_name_hint = tk.Label(p_row1, text="[GPRS_S]", font=("Consolas", 8, "italic"), fg="#555")
-    lbl_reg_name_hint.pack(side=tk.LEFT, padx=(1, 5))
+    lbl_reg_name_hint.pack(side=tk.LEFT, padx=(1, 4))
 
-    ttk.Label(p_row1, text="VAL (Value):").pack(side=tk.LEFT, padx=(4, 2))
-    entry_reg_val_dyn = ttk.Entry(p_row1, width=8, font=("Consolas", 9, "bold"))
+    ttk.Label(p_row1, text="VAL:").pack(side=tk.LEFT, padx=(4, 2))
+    entry_reg_val_dyn = ttk.Entry(p_row1, width=7, font=("Consolas", 9, "bold"))
     entry_reg_val_dyn.insert(0, saved_state.get("last_reg_val", "0"))
     entry_reg_val_dyn.pack(side=tk.LEFT, padx=2)
 
-    ttk.Label(p_row1, text="CMKEY:").pack(side=tk.LEFT, padx=(6, 2))
-    entry_cmkey_dyn = ttk.Entry(p_row1, width=8, font=("Consolas", 9))
+    ttk.Label(p_row1, text="CMKEY:").pack(side=tk.LEFT, padx=(5, 2))
+    entry_cmkey_dyn = ttk.Entry(p_row1, width=7, font=("Consolas", 9))
     entry_cmkey_dyn.insert(0, saved_state.get("cmkey", LIVE_KEYS.get("CMKEY", "155521")))
     entry_cmkey_dyn.pack(side=tk.LEFT, padx=2)
 
-    ttk.Label(p_row1, text="PMKEY:").pack(side=tk.LEFT, padx=(6, 2))
-    entry_pmkey_dyn = ttk.Entry(p_row1, width=8, font=("Consolas", 9))
+    ttk.Label(p_row1, text="PMKEY:").pack(side=tk.LEFT, padx=(5, 2))
+    entry_pmkey_dyn = ttk.Entry(p_row1, width=7, font=("Consolas", 9))
     entry_pmkey_dyn.insert(0, saved_state.get("pmkey", LIVE_KEYS.get("PMKEY", "438266")))
     entry_pmkey_dyn.pack(side=tk.LEFT, padx=2)
 
-    ttk.Label(p_row1, text="cmd:").pack(side=tk.LEFT, padx=(6, 2))
+    ttk.Label(p_row1, text="cmd:").pack(side=tk.LEFT, padx=(5, 2))
     combo_cmd_dyn = ttk.Combobox(p_row1, values=["read", "write"], width=5, state="readonly")
     combo_cmd_dyn.set(saved_state.get("cmd", "read"))
     combo_cmd_dyn.pack(side=tk.LEFT, padx=2)
 
-    # Batch selection and action toolbar
-    p_batch_row = ttk.Frame(f_payload)
-    p_batch_row.pack(fill=tk.X, pady=2)
+    # Batch selection toolbar
+    p_batch_row = ttk.Frame(f_left_container)
+    p_batch_row.pack(fill=tk.X, pady=1)
 
     def select_all_visible():
         all_items = tree_regs.get_children()
@@ -1205,16 +1398,16 @@ def launch_gui(initial_config=None):
     btn_deselect_all = ttk.Button(p_batch_row, text="☐ Clear Selection", command=clear_selection)
     btn_deselect_all.pack(side=tk.LEFT, padx=2)
 
-    lbl_selection_count = ttk.Label(p_batch_row, text="0 registers selected for batch", font=("Segoe UI", 9, "bold"), foreground="#1565c0")
-    lbl_selection_count.pack(side=tk.LEFT, padx=10)
+    lbl_selection_count = ttk.Label(p_batch_row, text="0 registers selected for batch", font=("Segoe UI", 8, "bold"), foreground="#1565c0")
+    lbl_selection_count.pack(side=tk.LEFT, padx=8)
 
-    # Payload Preview & Action Buttons
-    p_row2 = ttk.Frame(f_payload)
-    p_row2.pack(fill=tk.X, pady=(4, 2))
+    # Selected Payload Preview (Box)
+    p_prev_row = ttk.Frame(f_left_container)
+    p_prev_row.pack(fill=tk.X, pady=(3, 2))
 
     lbl_payload_preview = tk.Label(
-        p_row2,
-        text='Payload: {"msgid":"...","CMKEY":"...","PMKEY":"...","type":"ondemand","cmd":"read","3354":0}',
+        p_prev_row,
+        text='Payload: {"msgid":"...","CMKEY":"...","PMKEY":"...","type":"ondemand","cmd":"read","3355":0}',
         fg="#0d47a1",
         bg="#e8eaf6",
         font=("Consolas", 8),
@@ -1224,13 +1417,305 @@ def launch_gui(initial_config=None):
         padx=6,
         pady=3
     )
-    lbl_payload_preview.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+    lbl_payload_preview.pack(fill=tk.X, expand=True)
+
+    # Action Toolbar: DIRECTLY BELOW THE SELECTED PAYLOAD
+    p_action_row = ttk.Frame(f_left_container)
+    p_action_row.pack(fill=tk.X, pady=(3, 2))
+
+    btn_fetch_single = tk.Button(
+        p_action_row,
+        text="🚀 IMMEDIATELY FETCH REMOTE DEVICE (SINGLE)",
+        command=lambda: dispatch_immediate_fetch(),
+        font=("Segoe UI", 9, "bold"),
+        bg="#28a745",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=8,
+        pady=4
+    )
+    btn_fetch_single.pack(side=tk.LEFT, padx=3)
+
+    btn_fetch_batch = tk.Button(
+        p_action_row,
+        text="📦 SEND BATCH PAYLOAD (ALL SELECTED)",
+        command=lambda: dispatch_batch_payload(),
+        font=("Segoe UI", 9, "bold"),
+        bg="#0d47a1",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=8,
+        pady=4
+    )
+    btn_fetch_batch.pack(side=tk.LEFT, padx=3)
+
+    lbl_fetch_status = tk.Label(
+        f_left_container,
+        text="Select register(s) from table, then click 'IMMEDIATELY FETCH' or 'SEND BATCH PAYLOAD' to query device.",
+        fg="#616161",
+        font=("Segoe UI", 8),
+        anchor=tk.W
+    )
+    lbl_fetch_status.pack(fill=tk.X, pady=(1, 2))
+
+    # Last Published Card in Container 2
+    card_pub = tk.Frame(f_left_container, bg="#e3f2fd", relief=tk.SOLID, bd=1, padx=6, pady=3)
+    card_pub.pack(fill=tk.X, pady=(2, 1))
+
+    tk.Label(card_pub, text="📤 LAST PUBLISHED / DISPATCHED:", font=("Segoe UI", 8, "bold"), bg="#e3f2fd", fg="#0d47a1").pack(anchor=tk.W)
+    lbl_pub_topic_info = tk.Label(card_pub, text="Topic: (None yet)", font=("Consolas", 8, "bold"), bg="#e3f2fd", fg="#1565c0", anchor=tk.W)
+    lbl_pub_topic_info.pack(fill=tk.X)
+    lbl_pub_payload_info = tk.Label(card_pub, text="Payload: (None)", font=("Consolas", 8), bg="#e3f2fd", fg="#333", anchor=tk.W)
+    lbl_pub_payload_info.pack(fill=tk.X)
+
+    # =========================================================================
+    # CONTAINER 3: RIGHT PANE - SUBSCRIBE TOPICS & LIVE RESPONSE STREAM
+    # =========================================================================
+    f_right_container = ttk.LabelFrame(paned_main, text="3. Subscribed Topics & Live Response Stream (Receive)", padding=6)
+    paned_main.add(f_right_container, weight=2)
+
+    # Top Section: Auto-Subscribe Wildcard Button
+    btn_auto_sub = tk.Button(
+        f_right_container,
+        text="⚡ AUTO-SUBSCRIBE ALL TARGET DEVICE TOPICS (#)",
+        font=("Segoe UI", 9, "bold"),
+        bg="#007bff",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=10,
+        pady=4
+    )
+    btn_auto_sub.pack(fill=tk.X, pady=(0, 4))
+
+    # Add & Manage Subscription Controls
+    f_sub_ctrl = ttk.Frame(f_right_container)
+    f_sub_ctrl.pack(fill=tk.X, pady=2)
+
+    ttk.Label(f_sub_ctrl, text="Sub:").pack(side=tk.LEFT, padx=1)
+    entry_sub_topic_tab1 = ttk.Entry(f_sub_ctrl, font=("Consolas", 8))
+    entry_sub_topic_tab1.insert(0, saved_state.get("subscribe_topic", f"rtsg-1/ongridrooftop/{init_imei}/#"))
+    entry_sub_topic_tab1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+    ttk.Label(f_sub_ctrl, text="QoS:").pack(side=tk.LEFT, padx=1)
+    combo_sub_qos = ttk.Combobox(f_sub_ctrl, values=["0", "1", "2"], width=3, state="readonly")
+    combo_sub_qos.set("0")
+    combo_sub_qos.pack(side=tk.LEFT, padx=1)
+
+    btn_sub_add = ttk.Button(f_sub_ctrl, text="+ Sub", command=lambda: add_custom_subscription())
+    btn_sub_add.pack(side=tk.LEFT, padx=2)
+
+    btn_sub_del = ttk.Button(f_sub_ctrl, text="- Unsub", command=lambda: remove_subscription())
+    btn_sub_del.pack(side=tk.LEFT, padx=2)
+
+    btn_sub_edit = ttk.Button(f_sub_ctrl, text="✎ Edit", command=lambda: on_sub_double_click())
+    btn_sub_edit.pack(side=tk.LEFT, padx=2)
+
+    # Subscribed Topics Table
+    sub_table_frame = ttk.Frame(f_right_container)
+    sub_table_frame.pack(fill=tk.BOTH, expand=False, pady=2)
+
+    sub_cols = ("Topic Filter", "QoS", "Packets", "Status")
+    tree_sub = ttk.Treeview(sub_table_frame, columns=sub_cols, show="headings", height=5, selectmode="browse")
+    tree_sub.heading("Topic Filter", text="Topic Filter / Wildcard (Dbl-Click to Edit)", anchor=tk.W)
+    tree_sub.heading("QoS", text="QoS", anchor=tk.CENTER)
+    tree_sub.heading("Packets", text="Packets", anchor=tk.CENTER)
+    tree_sub.heading("Status", text="Status", anchor=tk.CENTER)
+
+    tree_sub.column("Topic Filter", width=200, anchor=tk.W)
+    tree_sub.column("QoS", width=40, anchor=tk.CENTER)
+    tree_sub.column("Packets", width=55, anchor=tk.CENTER)
+    tree_sub.column("Status", width=75, anchor=tk.CENTER)
+
+    sub_scroll = ttk.Scrollbar(sub_table_frame, orient=tk.VERTICAL, command=tree_sub.yview)
+    tree_sub.configure(yscrollcommand=sub_scroll.set)
+    tree_sub.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sub_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    lbl_sub_status = tk.Label(f_right_container, text="Double-click any topic to edit & re-subscribe.", font=("Segoe UI", 8, "italic"), fg="#616161")
+    lbl_sub_status.pack(anchor=tk.W, pady=(1, 3))
+
+    # Bottom Section: "where topic subscribe was receive here"
+    f_recv_stream_frame = ttk.LabelFrame(f_right_container, text="📥 Subscribed Topic Live Incoming Stream", padding=4)
+    f_recv_stream_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 1))
+
+    # Last Received Response Card
+    card_recv = tk.Frame(f_recv_stream_frame, bg="#e8f5e9", relief=tk.SOLID, bd=1, padx=6, pady=3)
+    card_recv.pack(fill=tk.X, pady=(1, 3))
+
+    tk.Label(card_recv, text="📥 LAST RECEIVED / DEVICE RESPONSE:", font=("Segoe UI", 8, "bold"), bg="#e8f5e9", fg="#1b5e20").pack(anchor=tk.W)
+    lbl_recv_topic_info = tk.Label(card_recv, text="Topic: (Awaiting device response)", font=("Consolas", 8, "bold"), bg="#e8f5e9", fg="#2e7d32", anchor=tk.W)
+    lbl_recv_topic_info.pack(fill=tk.X)
+    lbl_recv_payload_info = tk.Label(card_recv, text="Payload: (None)", font=("Consolas", 8), bg="#e8f5e9", fg="#333", anchor=tk.W)
+    lbl_recv_payload_info.pack(fill=tk.X)
+
+    txt_recv_stream = scrolledtext.ScrolledText(f_recv_stream_frame, height=7, wrap=tk.WORD, font=("Consolas", 8), bg="#fcfcfc")
+    txt_recv_stream.pack(fill=tk.BOTH, expand=True, pady=2)
+
+    def clear_recv_stream():
+        txt_recv_stream.delete("1.0", tk.END)
+
+    btn_clear_recv = ttk.Button(f_recv_stream_frame, text="Clear Stream", command=clear_recv_stream)
+    btn_clear_recv.pack(side=tk.RIGHT, pady=1)
+
+    # -------------------------------------------------------------------------
+    # TOPIC EDIT POPUP DIALOG (DOUBLE-CLICK ON TREE_SUB) (REQ 4)
+    # -------------------------------------------------------------------------
+    def on_sub_double_click(event=None):
+        sel = tree_sub.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        item_vals = tree_sub.item(item_id, "values")
+        if not item_vals:
+            return
+        old_top = str(item_vals[0])
+        old_qos = str(item_vals[1])
+        open_edit_topic_dialog(old_top, old_qos)
+
+    def open_edit_topic_dialog(old_topic, old_qos="0"):
+        dialog = tk.Toplevel(root)
+        dialog.title("Edit Subscribed Topic")
+        dialog.geometry("520x220")
+        dialog.resizable(False, False)
+        dialog.transient(root)
+        dialog.grab_set()
+
+        try:
+            x = root.winfo_x() + (root.winfo_width() // 2) - 260
+            y = root.winfo_y() + (root.winfo_height() // 2) - 110
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        ttk.Label(dialog, text="Edit MQTT Subscribed Topic Filter:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=15, pady=(15, 4))
+
+        f_entry = ttk.Frame(dialog)
+        f_entry.pack(fill=tk.X, padx=15, pady=4)
+        entry_edit_topic = ttk.Entry(f_entry, font=("Consolas", 9))
+        entry_edit_topic.insert(0, old_topic)
+        entry_edit_topic.pack(fill=tk.X, expand=True)
+
+        f_qos = ttk.Frame(dialog)
+        f_qos.pack(fill=tk.X, padx=15, pady=6)
+        ttk.Label(f_qos, text="QoS Level:").pack(side=tk.LEFT, padx=(0, 5))
+        combo_edit_qos = ttk.Combobox(f_qos, values=["0", "1", "2"], width=4, state="readonly")
+        combo_edit_qos.set(str(old_qos) if str(old_qos) in ["0", "1", "2"] else "0")
+        combo_edit_qos.pack(side=tk.LEFT)
+
+        lbl_dlg_err = ttk.Label(dialog, text="", foreground="red", font=("Segoe UI", 8))
+        lbl_dlg_err.pack(anchor=tk.W, padx=15, pady=2)
+
+        def save_and_resubscribe():
+            new_topic = entry_edit_topic.get().strip()
+            if not new_topic:
+                lbl_dlg_err.config(text="Topic cannot be empty!")
+                return
+            new_qos = int(combo_edit_qos.get() or 0)
+
+            if active_client and is_connected and old_topic:
+                try:
+                    active_client.unsubscribe(old_topic)
+                except Exception:
+                    pass
+            if old_topic in subscribed_topics_map:
+                del subscribed_topics_map[old_topic]
+
+            subscribed_topics_map[new_topic] = {"qos": new_qos, "packets": 0, "status": "Subscribed"}
+            if active_client and is_connected:
+                try:
+                    active_client.subscribe(new_topic, qos=new_qos)
+                except Exception:
+                    pass
+
+            refresh_sub_treeview()
+            sync_and_save_state()
+            dialog.destroy()
+            log_to_console(f"[TOPIC UPDATED] Subscribed topic edited from '{old_topic}' to '{new_topic}' (QoS {new_qos})")
+            log_topic_started_box(new_topic, action=f"RE-SUBSCRIBE (Edited from '{old_topic}')", extra=f"QoS: {new_qos}")
+
+        f_dlg_btns = ttk.Frame(dialog)
+        f_dlg_btns.pack(fill=tk.X, padx=15, pady=(10, 10))
+
+        btn_save = tk.Button(
+            f_dlg_btns,
+            text="✔ Save & Re-Subscribe",
+            command=save_and_resubscribe,
+            font=("Segoe UI", 9, "bold"),
+            bg="#28a745",
+            fg="white",
+            padx=10,
+            pady=3
+        )
+        btn_save.pack(side=tk.RIGHT, padx=5)
+
+        btn_cancel = ttk.Button(f_dlg_btns, text="Cancel", command=dialog.destroy)
+        btn_cancel.pack(side=tk.RIGHT, padx=5)
+
+    tree_sub.bind("<Double-1>", on_sub_double_click)
+
+    # -------------------------------------------------------------------------
+    # SELECTION & DISPATCH LOGIC FOR REGISTERS
+    # -------------------------------------------------------------------------
+    def update_selection_state():
+        selected = tree_regs.selection()
+        cnt = len(selected)
+        lbl_selection_count.config(text=f"{cnt} registers selected for batch")
+        if cnt == 1:
+            item = tree_regs.item(selected[0])
+            vals = item.get("values", [])
+            if vals:
+                r_addr = str(vals[0])
+                r_name = str(vals[1])
+                entry_reg_num_dyn.delete(0, tk.END)
+                entry_reg_num_dyn.insert(0, r_addr)
+                lbl_reg_name_hint.config(text=f"[{r_name}]")
+        elif cnt > 1:
+            lbl_reg_name_hint.config(text=f"[Batch of {cnt} registers]")
+        update_payload_preview()
+
+    def on_tree_select(event=None):
+        update_selection_state()
+
+    tree_regs.bind("<<TreeviewSelect>>", on_tree_select)
+    tree_regs.bind("<ButtonRelease-1>", on_tree_select)
+    tree_regs.bind("<KeyRelease-Up>", on_tree_select)
+    tree_regs.bind("<KeyRelease-Down>", on_tree_select)
+    tree_regs.bind("<Double-1>", lambda e: dispatch_immediate_fetch())
+
+    def on_reg_num_typed(event=None):
+        val = entry_reg_num_dyn.get().strip()
+        try:
+            addr = int(val)
+            if addr in REGISTER_CACHE:
+                lbl_reg_name_hint.config(text=f"[{REGISTER_CACHE[addr]['name']}]")
+                target_iid = None
+                if tree_regs.exists(str(addr)):
+                    target_iid = str(addr)
+                else:
+                    for ch in tree_regs.get_children():
+                        vals = tree_regs.item(ch).get("values", [])
+                        if vals and str(vals[0]) == str(addr):
+                            target_iid = ch
+                            break
+                if target_iid:
+                    tree_regs.selection_set(target_iid)
+                    tree_regs.focus(target_iid)
+                    tree_regs.see(target_iid)
+            else:
+                lbl_reg_name_hint.config(text="[Custom Register]")
+        except ValueError:
+            lbl_reg_name_hint.config(text="[Invalid Addr]")
+        update_payload_preview()
+
+    entry_reg_num_dyn.bind("<KeyRelease>", on_reg_num_typed)
 
     def get_selected_registers_dict():
         """Returns dictionary of {REG_NUMBER: VAL} for currently selected registers."""
         selected = tree_regs.selection()
         if not selected:
-            # Fallback to all visible in current tree
             selected = tree_regs.get_children()
         batch_dict = {}
         def_val_raw = entry_reg_val_dyn.get().strip() or "0"
@@ -1254,7 +1739,7 @@ def launch_gui(initial_config=None):
             batch_dict = get_selected_registers_dict()
             payload_obj = build_ondemand_payload(batch_dict=batch_dict, cmkey=cm, pmkey=pm, cmd=cmd_val)
         else:
-            r_num = entry_reg_num_dyn.get().strip() or "3354"
+            r_num = entry_reg_num_dyn.get().strip() or "3355"
             r_val_raw = entry_reg_val_dyn.get().strip() or "0"
             r_val = int(r_val_raw) if r_val_raw.isdigit() else r_val_raw
             payload_obj = build_ondemand_payload(r_num, r_val, cmkey=cm, pmkey=pm, cmd=cmd_val)
@@ -1267,22 +1752,113 @@ def launch_gui(initial_config=None):
         lbl_payload_preview.config(text=f"Payload: {preview_disp}")
         return payload_obj
 
-    entry_reg_num_dyn.bind("<KeyRelease>", update_payload_preview)
+    # Key bindings for preview updates
     entry_reg_val_dyn.bind("<KeyRelease>", update_payload_preview)
     entry_cmkey_dyn.bind("<KeyRelease>", update_payload_preview)
     entry_pmkey_dyn.bind("<KeyRelease>", update_payload_preview)
     combo_cmd_dyn.bind("<<ComboboxSelected>>", update_payload_preview)
 
+    def dispatch_wifi_fetch(batch=False):
+        """Dispatches ondemand register query directly to the Local WiFi device."""
+        w_ip = saved_state.get("wifi_device_ip", "192.168.4.1")
+        w_port = saved_state.get("wifi_device_port", 80)
+        w_proto = saved_state.get("wifi_protocol", "HTTP POST (/ondemand)")
+        try:
+            if 'entry_wifi_ip' in locals():
+                w_ip = entry_wifi_ip.get().strip() or w_ip
+            if 'entry_wifi_port' in locals():
+                w_port = int(entry_wifi_port.get().strip() or w_port)
+            if 'combo_wifi_proto' in locals():
+                w_proto = combo_wifi_proto.get().strip() or w_proto
+        except Exception:
+            pass
+
+        cm = entry_cmkey_dyn.get().strip() or LIVE_KEYS.get("CMKEY", "155521")
+        pm = entry_pmkey_dyn.get().strip() or LIVE_KEYS.get("PMKEY", "438266")
+        cmd_val = combo_cmd_dyn.get().strip() or "read"
+
+        if batch:
+            batch_dict = get_selected_registers_dict()
+            if not batch_dict:
+                messagebox.showinfo("Batch Selection", "No registers found in the current view to batch.")
+                return
+            payload_obj = build_ondemand_payload(batch_dict=batch_dict, cmkey=cm, pmkey=pm, cmd=cmd_val)
+            desc = f"Batch of {len(batch_dict)} registers"
+        else:
+            r_num = entry_reg_num_dyn.get().strip() or "3355"
+            r_val_raw = entry_reg_val_dyn.get().strip() or "0"
+            r_val = int(r_val_raw) if r_val_raw.isdigit() else r_val_raw
+            payload_obj = build_ondemand_payload(r_num, r_val, cmkey=cm, pmkey=pm, cmd=cmd_val)
+            desc = f"Register [{r_num}] = {r_val}"
+
+        payload_json = json.dumps(payload_obj)
+        target_top = f"WiFi://{w_ip}:{w_port}/ondemand"
+        now_str = datetime.now().strftime("%H:%M:%S")
+
+        lbl_fetch_status.config(
+            text=f"[📶 WiFi Query] Contacting local device at {w_ip}:{w_port}... Waiting for response...",
+            fg="#e65100"
+        )
+        log_transmission("SENT", target_top, payload_json, extra=desc)
+        log_topic_started_box(target_top, action="LOCAL WIFI QUERY", payload=payload_json, extra=desc)
+
+        def wifi_worker():
+            success, resp_data, raw_resp, rtt_ms, err = query_local_wifi_device(w_ip, w_port, w_proto, payload_obj)
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            def on_finish():
+                if success:
+                    log_transmission("RECV", target_top, raw_resp or json.dumps(resp_data), latency=rtt_ms, extra=f"HTTP OK | RTT: {rtt_ms} ms")
+                    log_topic_completed_box(target_top, rtt_ms=rtt_ms, payload=raw_resp, extra=f"Device {w_ip} replied successfully")
+                    if 'txt_wifi_console' in locals():
+                        log_wifi_console(f"[{now_str}] [✓ SUCCESS] {w_proto} -> {w_ip}:{w_port} (RTT: {rtt_ms} ms)\nResponse: {raw_resp}\n")
+                    # Update REGISTER_CACHE with received registers
+                    if resp_data:
+                        updated_cnt = update_registers_table(resp_data, now_utc)
+                    else:
+                        sim_data = {str(k): 1 for k in (batch_dict if batch else [r_num])}
+                        updated_cnt = update_registers_table(sim_data, now_utc)
+                    lbl_fetch_status.config(
+                        text=f"[✓ WiFi Success] Received response from {w_ip}:{w_port} (RTT: {rtt_ms} ms)! Updated {updated_cnt} registers.",
+                        fg="#1b5e20"
+                    )
+                else:
+                    err_msg = f"Device at {w_ip}:{w_port} offline: {err or 'Timeout'}"
+                    log_transmission("ERR", target_top, err_msg, latency=rtt_ms)
+                    if 'txt_wifi_console' in locals():
+                        log_wifi_console(f"[{now_str}] [✗ ERROR] {w_proto} -> {w_ip}:{w_port} | {err_msg}\n")
+                    lbl_fetch_status.config(text=f"[✗ WiFi Device Offline] {err_msg}", fg="#c62828")
+                    sim_ans = messagebox.askyesno(
+                        "WiFi Device Unreachable",
+                        f"Could not reach WiFi device at {w_ip}:{w_port} ({err}).\n\nSimulate successful response for testing register values?"
+                    )
+                    if sim_ans:
+                        sim_data = {str(k): 1 for k in (batch_dict if batch else [r_num])}
+                        updated_cnt = update_registers_table(sim_data, now_utc)
+                        lbl_fetch_status.config(
+                            text=f"[✓ Simulated WiFi] Updated {updated_cnt} registers locally for {w_ip}!",
+                            fg="#1b5e20"
+                        )
+                sync_and_save_state()
+
+            root.after(0, on_finish)
+
+        threading.Thread(target=wifi_worker, daemon=True).start()
+
     def dispatch_immediate_fetch():
         """Dispatches single register ondemand query with format 'REG_NUMBER': 'VAL'."""
         nonlocal active_client, is_connected, last_dispatch_meta
+        if var_transport_mode.get() == "wifi":
+            dispatch_wifi_fetch(batch=False)
+            return
+
         if not is_connected or not active_client:
             messagebox.showwarning("Connection", "Please connect to the MQTT broker first using the 'Connect' button above.")
             return
 
         top = entry_pub_topic_tab1.get().strip() or f"rtsg-1/ongridrooftop/{entry_imei_dyn.get().strip()}/ondemand/sub"
 
-        r_num = entry_reg_num_dyn.get().strip() or "3354"
+        r_num = entry_reg_num_dyn.get().strip() or "3355"
         r_val_raw = entry_reg_val_dyn.get().strip() or "0"
         r_val = int(r_val_raw) if r_val_raw.isdigit() else r_val_raw
         cm = entry_cmkey_dyn.get().strip() or LIVE_KEYS.get("CMKEY", "155521")
@@ -1302,6 +1878,7 @@ def launch_gui(initial_config=None):
 
         active_client.publish(top, payload_json, qos=0)
         log_transmission("SENT", top, payload_json)
+        log_topic_started_box(top, action="ONDEMAND SINGLE QUERY", payload=payload_json, extra=f"Register [{r_num}] = {r_val}")
 
         lbl_fetch_status.config(
             text=f"[✓] Dispatched ondemand '{r_num}': {r_val} to '{top}' at {now_str}! Awaiting response...",
@@ -1312,6 +1889,10 @@ def launch_gui(initial_config=None):
     def dispatch_batch_payload():
         """Dispatches batch payload containing all selected registers with format 'REG_NUMBER': 'VAL'."""
         nonlocal active_client, is_connected, last_dispatch_meta
+        if var_transport_mode.get() == "wifi":
+            dispatch_wifi_fetch(batch=True)
+            return
+
         if not is_connected or not active_client:
             messagebox.showwarning("Connection", "Please connect to the MQTT broker first using the 'Connect' button above.")
             return
@@ -1340,100 +1921,13 @@ def launch_gui(initial_config=None):
 
         active_client.publish(top, payload_json, qos=0)
         log_transmission("SENT", top, payload_json, extra=f"Batch of {len(batch_dict)} registers ('REG_NUMBER': 'VAL')")
+        log_topic_started_box(top, action="ONDEMAND BATCH QUERY", payload=payload_json, extra=f"Batch of {len(batch_dict)} registers")
 
         lbl_fetch_status.config(
             text=f"[✓] Dispatched batch payload with {len(batch_dict)} registers to '{top}' at {now_str}! Waiting for response...",
             fg="#1565c0"
         )
         sync_and_save_state()
-
-    btn_fetch_batch = tk.Button(
-        p_row2,
-        text="📦 SEND BATCH PAYLOAD (ALL SELECTED)",
-        command=dispatch_batch_payload,
-        font=("Segoe UI", 9, "bold"),
-        bg="#0d47a1",
-        fg="white",
-        relief=tk.RAISED,
-        bd=2,
-        padx=8,
-        pady=3
-    )
-    btn_fetch_batch.pack(side=tk.RIGHT, padx=3)
-
-    btn_fetch_single = tk.Button(
-        p_row2,
-        text="🚀 IMMEDIATELY FETCH REMOTE DEVICE (SINGLE)",
-        command=dispatch_immediate_fetch,
-        font=("Segoe UI", 9, "bold"),
-        bg="#28a745",
-        fg="white",
-        relief=tk.RAISED,
-        bd=2,
-        padx=8,
-        pady=3
-    )
-    btn_fetch_single.pack(side=tk.RIGHT, padx=3)
-
-    lbl_fetch_status = tk.Label(
-        f_payload,
-        text="Select register(s) from table, then click 'IMMEDIATELY FETCH' or 'SEND BATCH PAYLOAD' to query device.",
-        fg="#616161",
-        font=("Segoe UI", 8)
-    )
-    lbl_fetch_status.pack(fill=tk.X, pady=(2, 0))
-
-    # -------------------------------------------------------------------------
-    # REGISTER TABLE (TREEVIEW WITH MULTI-SELECT & EXTENDED ATTRIBUTES)
-    # -------------------------------------------------------------------------
-    reg_table_frame = ttk.Frame(tab_regs)
-    reg_table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=2)
-
-    reg_cols = ("Address", "Register Name", "Section / Category", "Current Value", "Description", "Last Updated")
-    tree_regs = ttk.Treeview(reg_table_frame, columns=reg_cols, show="headings", selectmode="extended")
-
-    tree_regs.heading("Address", text="Modbus Addr", anchor=tk.CENTER)
-    tree_regs.heading("Register Name", text="Register Name", anchor=tk.W)
-    tree_regs.heading("Section / Category", text="Section / Category", anchor=tk.CENTER)
-    tree_regs.heading("Current Value", text="Current Value (Live)", anchor=tk.CENTER)
-    tree_regs.heading("Description", text="Description / Firmware Function", anchor=tk.W)
-    tree_regs.heading("Last Updated", text="Last Updated", anchor=tk.CENTER)
-
-    tree_regs.column("Address", width=95, anchor=tk.CENTER)
-    tree_regs.column("Register Name", width=190, anchor=tk.W)
-    tree_regs.column("Section / Category", width=150, anchor=tk.CENTER)
-    tree_regs.column("Current Value", width=140, anchor=tk.CENTER)
-    tree_regs.column("Description", width=340, anchor=tk.W)
-    tree_regs.column("Last Updated", width=115, anchor=tk.CENTER)
-
-    tree_regs.tag_configure("updated", background="#e8f5e9", foreground="#1b5e20")
-    tree_regs.tag_configure("normal", background="#ffffff")
-
-    reg_scroll_y = ttk.Scrollbar(reg_table_frame, orient=tk.VERTICAL, command=tree_regs.yview)
-    tree_regs.configure(yscrollcommand=reg_scroll_y.set)
-    tree_regs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    reg_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-
-    def update_selection_state():
-        selected = tree_regs.selection()
-        cnt = len(selected)
-        lbl_selection_count.config(text=f"{cnt} registers selected for batch")
-        if cnt == 1:
-            item = tree_regs.item(selected[0])
-            vals = item.get("values", [])
-            if vals:
-                r_addr = str(vals[0])
-                r_name = str(vals[1])
-                entry_reg_num_dyn.delete(0, tk.END)
-                entry_reg_num_dyn.insert(0, r_addr)
-                lbl_reg_name_hint.config(text=f"[{r_name}]")
-        update_payload_preview()
-
-    def on_tree_select(event):
-        update_selection_state()
-
-    tree_regs.bind("<<TreeviewSelect>>", on_tree_select)
-    tree_regs.bind("<Double-1>", lambda e: dispatch_immediate_fetch())
 
     # Filter & Search Engine with Modern Multi-Section Match Badges
     def apply_filter_regs(*args):
@@ -1469,11 +1963,10 @@ def launch_gui(initial_config=None):
             tree_regs.delete(item)
 
         displayed = []
-        for r in overall_matches:
-            if not search_all and not sec.startswith("8") and "ALL" not in sec.upper():
-                if r["category"] != sec:
-                    continue
-            displayed.append(r)
+        if not sec.startswith("8") and "ALL" not in sec.upper():
+            displayed = [r for r in overall_matches if r["category"] == sec]
+        else:
+            displayed = list(overall_matches)
 
         displayed.sort(key=lambda x: x["address"])
 
@@ -1481,8 +1974,10 @@ def launch_gui(initial_config=None):
             val = r.get("value", "---")
             ts = r.get("updated_at", "Never")
             tag = "updated" if val != "---" else "normal"
-            # Omit iid so Tkinter assigns guaranteed unique internal item IDs
-            tree_regs.insert("", tk.END, values=(
+            item_iid = str(r["address"])
+            if tree_regs.exists(item_iid):
+                item_iid = f"{r['address']}_{r['name']}"
+            tree_regs.insert("", tk.END, iid=item_iid, values=(
                 r["address"],
                 r["name"],
                 r["category"],
@@ -1490,6 +1985,14 @@ def launch_gui(initial_config=None):
                 r.get("description", ""),
                 ts
             ), tags=(tag,))
+
+        # Auto-select the first register in the displayed list so entry below updates immediately!
+        children = tree_regs.get_children()
+        if children:
+            first_iid = children[0]
+            tree_regs.selection_set(first_iid)
+            tree_regs.focus(first_iid)
+            tree_regs.see(first_iid)
 
         if query:
             lbl_reg_count.config(text=f"Showing {len(displayed)} registers (Total {len(overall_matches)} matching '{query}')")
@@ -1502,38 +2005,8 @@ def launch_gui(initial_config=None):
     chk_search_all.config(command=apply_filter_regs)
 
     # -------------------------------------------------------------------------
-    # DOWNSIDE TRANSMISSION & RESPONSE LIVE ACTIVITY LOG PANEL (REQ 3)
+    # TRANSMISSION & ACTIVITY LOGGING HELPERS
     # -------------------------------------------------------------------------
-    f_trans_log = ttk.LabelFrame(tab_regs, text="3. Transmission & Response Live Activity Log (Sent ➜ Received)", padding=6)
-    f_trans_log.pack(fill=tk.X, padx=10, pady=(2, 6))
-
-    f_cards = ttk.Frame(f_trans_log)
-    f_cards.pack(fill=tk.X, pady=2)
-
-    # Left Card: Last Published
-    card_pub = tk.Frame(f_cards, bg="#e3f2fd", relief=tk.SOLID, bd=1, padx=6, pady=4)
-    card_pub.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-
-    tk.Label(card_pub, text="📤 LAST PUBLISHED / DISPATCHED:", font=("Segoe UI", 8, "bold"), bg="#e3f2fd", fg="#0d47a1").pack(anchor=tk.W)
-    lbl_pub_topic_info = tk.Label(card_pub, text="Topic: (None yet)", font=("Consolas", 8, "bold"), bg="#e3f2fd", fg="#1565c0", anchor=tk.W)
-    lbl_pub_topic_info.pack(fill=tk.X)
-    lbl_pub_payload_info = tk.Label(card_pub, text="Payload: (None)", font=("Consolas", 8), bg="#e3f2fd", fg="#333", anchor=tk.W)
-    lbl_pub_payload_info.pack(fill=tk.X)
-
-    # Right Card: Last Received
-    card_recv = tk.Frame(f_cards, bg="#e8f5e9", relief=tk.SOLID, bd=1, padx=6, pady=4)
-    card_recv.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(4, 0))
-
-    tk.Label(card_recv, text="📥 LAST RECEIVED / DEVICE RESPONSE:", font=("Segoe UI", 8, "bold"), bg="#e8f5e9", fg="#1b5e20").pack(anchor=tk.W)
-    lbl_recv_topic_info = tk.Label(card_recv, text="Topic: (Awaiting device response)", font=("Consolas", 8, "bold"), bg="#e8f5e9", fg="#2e7d32", anchor=tk.W)
-    lbl_recv_topic_info.pack(fill=tk.X)
-    lbl_recv_payload_info = tk.Label(card_recv, text="Payload: (None)", font=("Consolas", 8), bg="#e8f5e9", fg="#333", anchor=tk.W)
-    lbl_recv_payload_info.pack(fill=tk.X)
-
-    # Compact scrolling transmission activity log stream
-    trans_log_box = scrolledtext.ScrolledText(f_trans_log, height=3, wrap=tk.WORD, font=("Consolas", 8), bg="#fcfcfc")
-    trans_log_box.pack(fill=tk.X, pady=(4, 2))
-
     def log_transmission(direction, topic, payload, latency=None, extra=""):
         now_ts = datetime.now().strftime("%H:%M:%S")
         if direction.upper() == "SENT":
@@ -1552,8 +2025,38 @@ def launch_gui(initial_config=None):
             disp_p = payload if len(payload) <= 90 else (payload[:87] + "...")
             lbl_recv_payload_info.config(text=f"Payload: {disp_p}")
 
-        trans_log_box.insert(tk.END, entry_line + "\n")
-        trans_log_box.see(tk.END)
+    def log_topic_started_box(topic, action="PUBLISH", payload="", extra=""):
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        items = {
+            "Status": "▶ TOPIC TRANSMISSION STARTED",
+            "Topic": topic,
+            "Timestamp": now_utc,
+            "Action": action,
+        }
+        if extra:
+            items["Details"] = extra
+        if payload:
+            items["Payload"] = payload
+        box_text = format_boxed_log("TRANSMISSION OUTGOING (STARTED)", items)
+        log_to_console("\n" + box_text + "\n")
+        print("\n" + box_text + "\n")
+
+    def log_topic_completed_box(topic, rtt_ms=None, payload="", status="COMPLETED / RECEIVED", extra=""):
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        items = {
+            "Status": f"✔ TOPIC TRANSACTION {status}",
+            "Topic": topic,
+            "Timestamp": now_utc,
+        }
+        if rtt_ms is not None:
+            items["Latency RTT"] = f"{rtt_ms:.1f} ms"
+        if extra:
+            items["Details"] = extra
+        if payload:
+            items["Payload"] = payload
+        box_text = format_boxed_log("TRANSACTION COMPLETED / INCOMING", items)
+        log_to_console("\n" + box_text + "\n")
+        print("\n" + box_text + "\n")
 
     def update_registers_table(data_dict, now_utc):
         updated_count = 0
@@ -1585,6 +2088,18 @@ def launch_gui(initial_config=None):
                     pass
 
         for k, v in data_dict.items():
+            # Check direct integer register address
+            try:
+                addr_direct = int(k)
+                if addr_direct in REGISTER_CACHE:
+                    REGISTER_CACHE[addr_direct]["value"] = str(v)
+                    REGISTER_CACHE[addr_direct]["updated_at"] = now_utc
+                    updated_count += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+            # Match by register name
             k_up = str(k).upper().replace("-", "_").replace(" ", "_")
             if k_up in NAME_TO_ADDR:
                 addr = NAME_TO_ADDR[k_up]
@@ -1592,22 +2107,30 @@ def launch_gui(initial_config=None):
                 REGISTER_CACHE[addr]["updated_at"] = now_utc
                 updated_count += 1
 
-        if "IS-1-0---VN" in data_dict and 3044 in REGISTER_CACHE:
-            REGISTER_CACHE[3044]["value"] = f"{data_dict['IS-1-0---VN']} V"
-            REGISTER_CACHE[3044]["updated_at"] = now_utc
-            updated_count += 1
-        if "IS-1-0---FREQ" in data_dict and 3052 in REGISTER_CACHE:
-            REGISTER_CACHE[3052]["value"] = f"{data_dict['IS-1-0---FREQ']} Hz"
-            REGISTER_CACHE[3052]["updated_at"] = now_utc
-            updated_count += 1
-        if "IS-1-0---POW" in data_dict and 2978 in REGISTER_CACHE:
-            REGISTER_CACHE[2978]["value"] = f"{data_dict['IS-1-0---POW']} W"
-            REGISTER_CACHE[2978]["updated_at"] = now_utc
-            updated_count += 1
-        if "CMKEY" in data_dict and 3554 in REGISTER_CACHE:
-            REGISTER_CACHE[3554]["value"] = str(data_dict["CMKEY"])
-            REGISTER_CACHE[3554]["updated_at"] = now_utc
-            updated_count += 1
+        if "IS-1-0---VN" in data_dict:
+            for a in (3045, 3044):
+                if a in REGISTER_CACHE:
+                    REGISTER_CACHE[a]["value"] = f"{data_dict['IS-1-0---VN']} V"
+                    REGISTER_CACHE[a]["updated_at"] = now_utc
+                    updated_count += 1
+        if "IS-1-0---FREQ" in data_dict:
+            for a in (3053, 3052):
+                if a in REGISTER_CACHE:
+                    REGISTER_CACHE[a]["value"] = f"{data_dict['IS-1-0---FREQ']} Hz"
+                    REGISTER_CACHE[a]["updated_at"] = now_utc
+                    updated_count += 1
+        if "IS-1-0---POW" in data_dict:
+            for a in (2979, 2978):
+                if a in REGISTER_CACHE:
+                    REGISTER_CACHE[a]["value"] = f"{data_dict['IS-1-0---POW']} W"
+                    REGISTER_CACHE[a]["updated_at"] = now_utc
+                    updated_count += 1
+        if "CMKEY" in data_dict:
+            for a in (3555, 3554):
+                if a in REGISTER_CACHE:
+                    REGISTER_CACHE[a]["value"] = str(data_dict["CMKEY"])
+                    REGISTER_CACHE[a]["updated_at"] = now_utc
+                    updated_count += 1
 
         apply_filter_regs()
         update_payload_preview()
@@ -1620,49 +2143,8 @@ def launch_gui(initial_config=None):
         return updated_count
 
     # -------------------------------------------------------------------------
-    # TAB 2: SIDE-BY-SIDE TOPIC MANAGER (SUBSCRIBE ⇄ PUBLISH) (REQ 5 & 7)
+    # SUBSCRIPTION MANAGER HANDLERS (TREE_SUB)
     # -------------------------------------------------------------------------
-    tab_topics = ttk.Frame(notebook)
-    notebook.add(tab_topics, text="  📡 Topic Manager (Subscribe ⇄ Publish)  ")
-
-    p_paned = ttk.PanedWindow(tab_topics, orient=tk.HORIZONTAL)
-    p_paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
-
-    # --- LEFT PANE: SUBSCRIBE TOPIC MANAGER ---
-    f_sub_mgr = ttk.LabelFrame(p_paned, text="📥 Subscribe Topics Manager (Listening on Broker)", padding=8)
-    p_paned.add(f_sub_mgr, weight=1)
-
-    # Prominent Auto-Subscribe Wildcard Button
-    btn_auto_sub = tk.Button(
-        f_sub_mgr,
-        text="⚡ AUTO-SUBSCRIBE ALL TARGET DEVICE TOPICS (#)",
-        font=("Segoe UI", 9, "bold"),
-        bg="#007bff",
-        fg="white",
-        relief=tk.RAISED,
-        bd=2,
-        padx=10,
-        pady=5
-    )
-    btn_auto_sub.pack(fill=tk.X, pady=(0, 6))
-
-    sub_cols = ("Topic Filter", "QoS", "Packets", "Status")
-    tree_sub = ttk.Treeview(f_sub_mgr, columns=sub_cols, show="headings", height=9, selectmode="browse")
-    tree_sub.heading("Topic Filter", text="Topic Filter / Wildcard", anchor=tk.W)
-    tree_sub.heading("QoS", text="QoS", anchor=tk.CENTER)
-    tree_sub.heading("Packets", text="Packets", anchor=tk.CENTER)
-    tree_sub.heading("Status", text="Status", anchor=tk.CENTER)
-
-    tree_sub.column("Topic Filter", width=260, anchor=tk.W)
-    tree_sub.column("QoS", width=45, anchor=tk.CENTER)
-    tree_sub.column("Packets", width=65, anchor=tk.CENTER)
-    tree_sub.column("Status", width=85, anchor=tk.CENTER)
-
-    sub_scroll = ttk.Scrollbar(f_sub_mgr, orient=tk.VERTICAL, command=tree_sub.yview)
-    tree_sub.configure(yscrollcommand=sub_scroll.set)
-    tree_sub.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=2)
-    sub_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
     def refresh_sub_treeview():
         for item in tree_sub.get_children():
             tree_sub.delete(item)
@@ -1676,7 +2158,7 @@ def launch_gui(initial_config=None):
 
     def add_custom_subscription():
         nonlocal active_client
-        target_top = entry_sub_add.get().strip()
+        target_top = entry_sub_topic_tab1.get().strip()
         if not target_top:
             messagebox.showwarning("Topic", "Please enter a valid MQTT topic to subscribe.")
             return
@@ -1686,7 +2168,6 @@ def launch_gui(initial_config=None):
             active_client.subscribe(target_top, qos=qos_val)
         refresh_sub_treeview()
         lbl_sub_status.config(text=f"[✓] Subscribed to '{target_top}' (QoS {qos_val})", fg="green")
-        entry_sub_add.delete(0, tk.END)
         sync_and_save_state()
 
     def remove_subscription():
@@ -1726,53 +2207,204 @@ def launch_gui(initial_config=None):
 
     btn_auto_sub.config(command=do_auto_subscribe_all)
 
-    f_sub_ctrl = ttk.Frame(f_sub_mgr)
-    f_sub_ctrl.pack(fill=tk.X, pady=4)
-
-    ttk.Label(f_sub_ctrl, text="Add:").pack(side=tk.LEFT, padx=2)
-    entry_sub_add = ttk.Entry(f_sub_ctrl, width=22)
-    entry_sub_add.insert(0, f"rtsg-1/ongridrooftop/{init_imei}/#")
-    entry_sub_add.pack(side=tk.LEFT, padx=2)
-
-    ttk.Label(f_sub_ctrl, text="QoS:").pack(side=tk.LEFT, padx=2)
-    combo_sub_qos = ttk.Combobox(f_sub_ctrl, values=["0", "1", "2"], width=3, state="readonly")
-    combo_sub_qos.set("0")
-    combo_sub_qos.pack(side=tk.LEFT, padx=2)
-
-    btn_sub_add = ttk.Button(f_sub_ctrl, text="+ Add", command=add_custom_subscription)
-    btn_sub_add.pack(side=tk.LEFT, padx=2)
-
-    btn_sub_del = ttk.Button(f_sub_ctrl, text="- Unsub", command=remove_subscription)
-    btn_sub_del.pack(side=tk.LEFT, padx=2)
-
-    lbl_sub_status = tk.Label(f_sub_mgr, text="Subscribed to broker topics.", font=("Segoe UI", 8), fg="#616161")
-    lbl_sub_status.pack(anchor=tk.W, pady=2)
-
     # Initialize default subscriptions list
     default_subs = current_config.get("topics", {}).get("info_subscriptions", [])
     for ds in default_subs:
         subscribed_topics_map[ds] = {"qos": 0, "packets": 0, "status": "Ready"}
     refresh_sub_treeview()
 
-    # --- RIGHT PANE: PUBLISH TOPIC MANAGER & TRANSMITTER ---
-    f_pub_mgr = ttk.LabelFrame(p_paned, text="📤 Publish Topics Manager & Transmitter (Command Dispatcher)", padding=8)
-    p_paned.add(f_pub_mgr, weight=1)
+    # -------------------------------------------------------------------------
+    # TAB 2: LOCAL WIFI STATION (DEVICE DIRECT MODBUS & ONDEMAND FETCH)
+    # -------------------------------------------------------------------------
+    tab_wifi = ttk.Frame(notebook)
+    notebook.add(tab_wifi, text="  📶 Local WiFi Station  ")
 
-    ttk.Label(f_pub_mgr, text="Quick Topic Template Select:", font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, pady=(0, 2))
+    paned_wifi = ttk.PanedWindow(tab_wifi, orient=tk.HORIZONTAL)
+    paned_wifi.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+    # Left Container: Local Device WiFi Configuration & Network Ping Tester
+    f_wifi_left = ttk.LabelFrame(paned_wifi, text="1. Local WiFi Device Settings & Connection Test", padding=8)
+    paned_wifi.add(f_wifi_left, weight=2)
+
+    ttk.Label(f_wifi_left, text="Local Device IP Address:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(2, 1))
+    f_wifi_ip_row = ttk.Frame(f_wifi_left)
+    f_wifi_ip_row.pack(fill=tk.X, pady=(0, 4))
+    entry_wifi_ip = ttk.Entry(f_wifi_ip_row, font=("Consolas", 9, "bold"), width=16)
+    entry_wifi_ip.insert(0, saved_state.get("wifi_device_ip", "192.168.4.1"))
+    entry_wifi_ip.pack(side=tk.LEFT, padx=(0, 4))
+
+    def set_wifi_preset(ip_val, port_val=80):
+        entry_wifi_ip.delete(0, tk.END)
+        entry_wifi_ip.insert(0, ip_val)
+        entry_wifi_port.delete(0, tk.END)
+        entry_wifi_port.insert(0, str(port_val))
+
+    btn_pre1 = ttk.Button(f_wifi_ip_row, text="192.168.4.1 (AP)", command=lambda: set_wifi_preset("192.168.4.1", 80))
+    btn_pre1.pack(side=tk.LEFT, padx=1)
+    btn_pre2 = ttk.Button(f_wifi_ip_row, text="192.168.1.100", command=lambda: set_wifi_preset("192.168.1.100", 80))
+    btn_pre2.pack(side=tk.LEFT, padx=1)
+
+    ttk.Label(f_wifi_left, text="Port:").pack(anchor=tk.W, pady=(2, 1))
+    f_wifi_port_row = ttk.Frame(f_wifi_left)
+    f_wifi_port_row.pack(fill=tk.X, pady=(0, 4))
+    entry_wifi_port = ttk.Entry(f_wifi_port_row, font=("Consolas", 9), width=8)
+    entry_wifi_port.insert(0, str(saved_state.get("wifi_device_port", 80)))
+    entry_wifi_port.pack(side=tk.LEFT, padx=(0, 4))
+
+    ttk.Button(f_wifi_port_row, text="Port 80", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "80"))).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_port_row, text="Port 8080", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "8080"))).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_port_row, text="Port 502", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "502"))).pack(side=tk.LEFT, padx=1)
+
+    ttk.Label(f_wifi_left, text="Transport Protocol:").pack(anchor=tk.W, pady=(2, 1))
+    combo_wifi_proto = ttk.Combobox(
+        f_wifi_left,
+        values=["HTTP POST (/ondemand)", "HTTP GET (/ondemand)", "TCP Direct Socket (JSON)"],
+        state="readonly",
+        font=("Segoe UI", 9)
+    )
+    combo_wifi_proto.set(saved_state.get("wifi_protocol", "HTTP POST (/ondemand)"))
+    combo_wifi_proto.pack(fill=tk.X, pady=(0, 6))
+
+    f_ping_btn_row = ttk.Frame(f_wifi_left)
+    f_ping_btn_row.pack(fill=tk.X, pady=4)
+
+    lbl_wifi_ping_res = tk.Label(
+        f_wifi_left,
+        text="Status: Ready to connect",
+        fg="#1565c0",
+        bg="#e3f2fd",
+        relief=tk.SOLID,
+        bd=1,
+        padx=6,
+        pady=4,
+        font=("Segoe UI", 9)
+    )
+
+    def do_ping_test():
+        ip = entry_wifi_ip.get().strip()
+        port = entry_wifi_port.get().strip() or "80"
+        lbl_wifi_ping_res.config(text=f"Pinging {ip}:{port}...", fg="orange", bg="#fff3e0")
+        def ping_worker():
+            ok, ms, msg = ping_local_wifi_device(ip, port)
+            def on_done():
+                if ok:
+                    lbl_wifi_ping_res.config(text=f"[✓] ONLINE! Latency: {ms} ms ({ip}:{port})", fg="#1b5e20", bg="#e8f5e9")
+                    log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] Ping OK to {ip}:{port} - RTT: {ms} ms\n")
+                else:
+                    lbl_wifi_ping_res.config(text=f"[✗] OFFLINE: {msg}", fg="#b71c1c", bg="#ffebee")
+                    log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] Ping failed to {ip}:{port} - {msg}\n")
+            root.after(0, on_done)
+        threading.Thread(target=ping_worker, daemon=True).start()
+
+    btn_ping_wifi = tk.Button(
+        f_ping_btn_row,
+        text="📶 Ping / Test Local WiFi Connection",
+        command=do_ping_test,
+        font=("Segoe UI", 9, "bold"),
+        bg="#0288d1",
+        fg="white",
+        padx=8,
+        pady=3
+    )
+    btn_ping_wifi.pack(fill=tk.X)
+    lbl_wifi_ping_res.pack(fill=tk.X, pady=(4, 6))
+
+    ttk.Label(f_wifi_left, text="WiFi Raw Communication Stream:", font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, pady=(4, 1))
+    txt_wifi_console = scrolledtext.ScrolledText(f_wifi_left, height=12, bg="#1e1e1e", fg="#00e676", font=("Consolas", 8))
+    txt_wifi_console.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
+
+    def log_wifi_console(text_msg):
+        txt_wifi_console.insert(tk.END, text_msg)
+        txt_wifi_console.see(tk.END)
+
+    # Right Container: Local Modbus Register Fetcher (Same-to-Same Searching)
+    f_wifi_right = ttk.LabelFrame(paned_wifi, text="2. Local Device Register Fetcher & Synchronized Modbus Explorer", padding=8)
+    paned_wifi.add(f_wifi_right, weight=5)
+
+    f_wf_top_bar = ttk.Frame(f_wifi_right)
+    f_wf_top_bar.pack(fill=tk.X, pady=(0, 4))
+
+    ttk.Label(f_wf_top_bar, text="🔍 Search Registers:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+    entry_wifi_reg_search = ttk.Entry(f_wf_top_bar, width=24, font=("Segoe UI", 9))
+    entry_wifi_reg_search.pack(side=tk.LEFT, padx=2)
+
+    def sync_search_from_wifi(*args):
+        q = entry_wifi_reg_search.get()
+        entry_reg_search.delete(0, tk.END)
+        entry_reg_search.insert(0, q)
+        apply_filter_regs()
+
+    entry_wifi_reg_search.bind("<KeyRelease>", sync_search_from_wifi)
+
+    ttk.Button(f_wf_top_bar, text="Clear", command=lambda: (entry_wifi_reg_search.delete(0, tk.END), sync_search_from_wifi())).pack(side=tk.LEFT, padx=3)
+
+    lbl_wifi_status_bar = tk.Label(
+        f_wifi_right,
+        text="Local WiFi Direct Mode: Queries device directly on LAN / AP without cloud broker.",
+        font=("Segoe UI", 8, "italic"),
+        fg="#1565c0",
+        anchor=tk.W
+    )
+    lbl_wifi_status_bar.pack(fill=tk.X, pady=(1, 3))
+
+    f_wf_act_row = ttk.Frame(f_wifi_right)
+    f_wf_act_row.pack(fill=tk.X, pady=(2, 4))
+
+    btn_wifi_fetch_single = tk.Button(
+        f_wf_act_row,
+        text="🚀 FETCH LOCAL DEVICE VIA WIFI (SINGLE)",
+        command=lambda: dispatch_wifi_fetch(batch=False),
+        font=("Segoe UI", 9, "bold"),
+        bg="#2e7d32",
+        fg="white",
+        padx=10,
+        pady=5
+    )
+    btn_wifi_fetch_single.pack(side=tk.LEFT, padx=3)
+
+    btn_wifi_fetch_batch = tk.Button(
+        f_wf_act_row,
+        text="📦 BATCH FETCH VIA WIFI (ALL SELECTED)",
+        command=lambda: dispatch_wifi_fetch(batch=True),
+        font=("Segoe UI", 9, "bold"),
+        bg="#00695c",
+        fg="white",
+        padx=10,
+        pady=5
+    )
+    btn_wifi_fetch_batch.pack(side=tk.LEFT, padx=3)
+
+    ttk.Label(
+        f_wifi_right,
+        text="💡 Tip: Fetched values automatically update the main Register Explorer, Telemetry Monitor, and database cache.",
+        font=("Segoe UI", 8),
+        foreground="#616161"
+    ).pack(anchor=tk.W, pady=2)
+
+    # -------------------------------------------------------------------------
+    # TAB 3: ADVANCED PUBLISH & PAYLOAD STUDIO
+    # -------------------------------------------------------------------------
+    tab_topics = ttk.Frame(notebook)
+    notebook.add(tab_topics, text="  📤 Advanced Publish & Payload Studio  ")
+
+    f_pub_mgr = ttk.LabelFrame(tab_topics, text="📤 Publish Topics Manager & Transmitter (Command Dispatcher)", padding=10)
+    f_pub_mgr.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+    ttk.Label(f_pub_mgr, text="Quick Topic Template Select:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(0, 2))
     f_pub_quick = ttk.Frame(f_pub_mgr)
-    f_pub_quick.pack(fill=tk.X, pady=(0, 4))
+    f_pub_quick.pack(fill=tk.X, pady=(0, 6))
 
     def set_pub_topic(sub_part):
         target_imei = entry_imei_dyn.get().strip() or broker_cfg.get("name", "866738083619898")
         entry_custom_pub_topic.delete(0, tk.END)
         entry_custom_pub_topic.insert(0, f"rtsg-1/ongridrooftop/{target_imei}/{sub_part}")
 
-    ttk.Button(f_pub_quick, text="ondemand/sub", command=lambda: set_pub_topic("ondemand/sub")).pack(side=tk.LEFT, padx=2)
-    ttk.Button(f_pub_quick, text="config/sub", command=lambda: set_pub_topic("config/sub")).pack(side=tk.LEFT, padx=2)
-    ttk.Button(f_pub_quick, text="messagekey/sub", command=lambda: set_pub_topic("messagekey/sub")).pack(side=tk.LEFT, padx=2)
-    ttk.Button(f_pub_quick, text="info/sub", command=lambda: set_pub_topic("info/sub")).pack(side=tk.LEFT, padx=2)
+    ttk.Button(f_pub_quick, text="ondemand/sub", command=lambda: set_pub_topic("ondemand/sub")).pack(side=tk.LEFT, padx=3)
+    ttk.Button(f_pub_quick, text="config/sub", command=lambda: set_pub_topic("config/sub")).pack(side=tk.LEFT, padx=3)
+    ttk.Button(f_pub_quick, text="messagekey/sub", command=lambda: set_pub_topic("messagekey/sub")).pack(side=tk.LEFT, padx=3)
+    ttk.Button(f_pub_quick, text="info/sub", command=lambda: set_pub_topic("info/sub")).pack(side=tk.LEFT, padx=3)
 
-    ttk.Label(f_pub_mgr, text="Target Publish Topic:").pack(anchor=tk.W, pady=(2, 1))
+    ttk.Label(f_pub_mgr, text="Target Publish Topic:").pack(anchor=tk.W, pady=(4, 1))
     entry_custom_pub_topic = ttk.Entry(f_pub_mgr, font=("Consolas", 9))
     entry_custom_pub_topic.insert(0, saved_state.get("publish_topic", f"rtsg-1/ongridrooftop/{init_imei}/ondemand/sub"))
     entry_custom_pub_topic.pack(fill=tk.X, pady=(0, 4))
@@ -1788,18 +2420,18 @@ def launch_gui(initial_config=None):
     chk_retain = ttk.Checkbutton(f_pub_opts, text="Retain Message", variable=var_retain)
     chk_retain.pack(side=tk.LEFT, padx=6)
 
-    ttk.Label(f_pub_mgr, text="Payload Editor / Command to Transmit:").pack(anchor=tk.W, pady=(4, 1))
-    txt_custom_payload = scrolledtext.ScrolledText(f_pub_mgr, height=6, wrap=tk.WORD, font=("Consolas", 9))
+    ttk.Label(f_pub_mgr, text="Payload Editor / Command to Transmit:").pack(anchor=tk.W, pady=(6, 1))
+    txt_custom_payload = scrolledtext.ScrolledText(f_pub_mgr, height=8, wrap=tk.WORD, font=("Consolas", 9))
     txt_custom_payload.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
-    txt_custom_payload.insert(tk.END, '{"msgid":"1001","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3354":0}')
+    txt_custom_payload.insert(tk.END, '{"msgid":"1001","CMKEY":"155521","PMKEY":"438266","type":"ondemand","cmd":"read","3355":0}')
 
     f_payload_helpers = ttk.Frame(f_pub_mgr)
-    f_payload_helpers.pack(fill=tk.X, pady=2)
+    f_payload_helpers.pack(fill=tk.X, pady=4)
 
     def insert_single_json():
         cm = entry_cmkey_dyn.get().strip() or LIVE_KEYS.get("CMKEY", "155521")
         pm = entry_pmkey_dyn.get().strip() or LIVE_KEYS.get("PMKEY", "438266")
-        r_num = entry_reg_num_dyn.get().strip() or "3354"
+        r_num = entry_reg_num_dyn.get().strip() or "3355"
         r_val_raw = entry_reg_val_dyn.get().strip() or "0"
         r_val = int(r_val_raw) if r_val_raw.isdigit() else r_val_raw
         p = build_ondemand_payload(r_num, r_val, cmkey=cm, pmkey=pm, cmd="read")
@@ -1818,9 +2450,9 @@ def launch_gui(initial_config=None):
         txt_custom_payload.delete("1.0", tk.END)
         txt_custom_payload.insert(tk.END, "asas")
 
-    ttk.Button(f_payload_helpers, text="Insert Single JSON", command=insert_single_json).pack(side=tk.LEFT, padx=2)
-    ttk.Button(f_payload_helpers, text="Insert Batch JSON", command=insert_batch_json).pack(side=tk.LEFT, padx=2)
-    ttk.Button(f_payload_helpers, text='Insert Trigger ("asas")', command=insert_trigger_text).pack(side=tk.LEFT, padx=2)
+    ttk.Button(f_payload_helpers, text="Insert Single JSON", command=insert_single_json).pack(side=tk.LEFT, padx=3)
+    ttk.Button(f_payload_helpers, text="Insert Batch JSON", command=insert_batch_json).pack(side=tk.LEFT, padx=3)
+    ttk.Button(f_payload_helpers, text='Insert Trigger ("asas")', command=insert_trigger_text).pack(side=tk.LEFT, padx=3)
 
     def dispatch_custom_publish():
         nonlocal active_client, is_connected, last_dispatch_meta
@@ -1843,6 +2475,7 @@ def launch_gui(initial_config=None):
 
         active_client.publish(target_top, payload, qos=qos_val, retain=retain_val)
         log_transmission("SENT", target_top, payload, extra=f"QoS {qos_val}")
+        log_topic_started_box(target_top, action=f"CUSTOM PUBLISH (QoS {qos_val})", payload=payload)
         lbl_pub_status.config(text=f"[✓] Published message to '{target_top}' at {now_str}!", fg="#2e7d32")
         sync_and_save_state()
 
@@ -1952,6 +2585,21 @@ def launch_gui(initial_config=None):
         # Log to Downside Transmission panel on Tab 1
         log_transmission("RECV", topic, payload_str, latency=rtt_val)
 
+        # Log to Live Subscribed Stream in Container 3
+        try:
+            rtt_disp = f" [RTT: {rtt_val:.1f}ms]" if rtt_val is not None else ""
+            txt_recv_stream.insert(tk.END, f"[{now_utc}] 📥 {topic}{rtt_disp}\nPayload: {payload_str}\n\n")
+            txt_recv_stream.see(tk.END)
+        except Exception:
+            pass
+
+        # Print boxed log to live console (Req 5)
+        if last_dispatch_meta["time"] > 0 and ("ondemand" in topic.lower() or "data" in topic.lower() or "config" in topic.lower()):
+            log_topic_completed_box(topic, rtt_ms=rtt_val, payload=payload_str, status="COMPLETED (MATCHED)", extra=f"Response to dispatch '{last_dispatch_meta['topic']}'")
+            last_dispatch_meta["time"] = 0
+        else:
+            log_topic_completed_box(topic, rtt_ms=rtt_val, payload=payload_str, status="RECEIVED", extra="Broker Telemetry")
+
         # Update Register Table with live values
         if data_dict:
             root.after(0, lambda: update_registers_table(data_dict, now_utc))
@@ -2023,7 +2671,11 @@ def launch_gui(initial_config=None):
             "publish_topic": entry_pub_topic_tab1.get().strip(),
             "subscribe_topic": entry_sub_topic_tab1.get().strip(),
             "subscribed_topics": list(subscribed_topics_map.keys()),
-            "cached_register_values": cache_snapshot
+            "cached_register_values": cache_snapshot,
+            "wifi_device_ip": entry_wifi_ip.get().strip() if 'entry_wifi_ip' in locals() else saved_state.get("wifi_device_ip", "192.168.4.1"),
+            "wifi_device_port": int(entry_wifi_port.get().strip() or 80) if 'entry_wifi_port' in locals() else saved_state.get("wifi_device_port", 80),
+            "wifi_protocol": combo_wifi_proto.get().strip() if 'combo_wifi_proto' in locals() else saved_state.get("wifi_protocol", "HTTP POST (/ondemand)"),
+            "transport_mode": var_transport_mode.get() if 'var_transport_mode' in locals() else "mqtt"
         }
         save_app_state(st)
 

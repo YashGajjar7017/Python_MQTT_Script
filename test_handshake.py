@@ -46,29 +46,36 @@ def run_tests():
         get_gprs_registers,
         build_ondemand_payload
     )
-    from MQTT_SERVER_CONTROLLER import load_app_state, save_app_state, APP_STATE_FILE
+    from MQTT_SERVER_CONTROLLER import load_app_state, save_app_state, APP_STATE_FILE, format_boxed_log
     assert len(ALL_REGISTERS) >= 200, f"Expected >200 registers, got {len(ALL_REGISTERS)}"
     assert "1. GPRS_Connection" in SECTIONS, "Missing 1. GPRS_Connection in SECTIONS"
     assert "2. SPIFFS_Storage" in SECTIONS, "Missing 2. SPIFFS_Storage in SECTIONS"
     assert "3. Restart_Count" in SECTIONS, "Missing 3. Restart_Count in SECTIONS"
 
+    # Verify Requirement 1: All registers must be odd numbers (+1 shifted)
+    assert all(r["address"] % 2 != 0 for r in ALL_REGISTERS), "All registers must have odd addresses (+1 shifted)"
+
     # Test single register payload structure requested by user ("REG_NUMBER": "VAL")
-    payload = build_ondemand_payload("3354", 0, cmkey="155521", pmkey="438266", cmd="read")
+    payload = build_ondemand_payload("3355", 0, cmkey="155521", pmkey="438266", cmd="read")
     assert payload["type"] == "ondemand", "type must be ondemand"
     assert payload["cmd"] == "read", "cmd must be read"
     assert payload["CMKEY"] == "155521", "CMKEY must match"
     assert payload["PMKEY"] == "438266", "PMKEY must match"
-    assert payload["3354"] == 0, "Dynamic reg must match 'REG_NUMBER': 'VAL'"
+    assert payload["3355"] == 0, "Dynamic reg must match 'REG_NUMBER': 'VAL'"
     assert "msgid" in payload and "timestamp" in payload
 
     # Test batch payload structure ("REG_NUMBER": "VAL")
-    batch_map = {"3354": 0, "3362": 0, "3364": 0}
+    batch_map = {"3355": 0, "3363": 0, "3365": 0}
     batch_payload = build_ondemand_payload(batch_dict=batch_map, cmkey="155521", pmkey="438266", cmd="read")
     assert batch_payload["type"] == "ondemand"
     assert batch_payload["cmd"] == "read"
-    assert batch_payload["3354"] == 0
-    assert batch_payload["3362"] == 0
-    assert batch_payload["3364"] == 0
+    assert batch_payload["3355"] == 0
+    assert batch_payload["3363"] == 0
+    assert batch_payload["3365"] == 0
+
+    # Test boxed framing logger
+    box_sample = format_boxed_log("TEST STARTED", {"Topic": "test/topic", "Action": "DISPATCH"})
+    assert "╔" in box_sample and "╚" in box_sample and "TEST STARTED" in box_sample
 
     # Test multi-section search with badges
     overall, counts = search_across_all_sections("GPRS")
