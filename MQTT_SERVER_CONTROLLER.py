@@ -28,6 +28,7 @@ import random
 import argparse
 import getpass
 import threading
+import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -255,6 +256,40 @@ def get_saved_password(host, username="", port=8883):
 #           LOCAL WIFI & MODBUS POLL TCP/IP PROTOCOL ENGINE (DIRECT LAN / AP)
 # ==============================================================================
 
+# ── Import Modbus reader library modules as reusable components ───────────────
+_MODBUS_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Modbus reader")
+if _MODBUS_LIB_DIR not in sys.path:
+    sys.path.insert(0, _MODBUS_LIB_DIR)
+
+try:
+    import modbus_poll_3 as _mp3
+    from modbus_poll_3 import (
+        SocketModbusClient      as _SocketModbusClient,
+        read_registers          as _modbus_read_registers,
+        write_single_register_with_ack as _modbus_write_ack,
+    )
+    _MODBUS_LIB_OK = True
+except Exception as _e:
+    _MODBUS_LIB_OK = False
+    _SocketModbusClient = None
+    _modbus_read_registers = None
+    _modbus_write_ack = None
+
+try:
+    import compare_registers as _comp_reg
+    _COMPARE_LIB_OK = True
+except Exception:
+    _comp_reg = None
+    _COMPARE_LIB_OK = False
+
+try:
+    import port_scanner as _pscan
+    _PORT_SCANNER_LIB_OK = True
+except Exception:
+    _pscan = None
+    _PORT_SCANNER_LIB_OK = False
+
+
 MODBUS_TRANSACTION_ID = 1
 
 def get_next_modbus_trans_id():
@@ -278,6 +313,25 @@ def calc_modbus_crc16(data: bytes) -> int:
             else:
                 crc >>= 1
     return crc
+
+
+def calc_wire_addr(reg_addr: int, zero_based: bool = True) -> int:
+    """
+    Converts a Modbus register number to its on-wire address.
+    Modbus Poll tool uses zero-based addressing:
+        wire_addr = reg_addr - 40001  if register >= 40001 (4xxxx range)
+        wire_addr = reg_addr - 1      if 1-based (Modbus convention)
+        wire_addr = reg_addr          if already 0-based
+
+    For this device (ESP32) registers 40001-40120 map to wire address 0-119.
+    If zero_based=True  → wire_addr = reg_addr (already 0-based, e.g. 3355 → 3355)
+    If zero_based=False → wire_addr = reg_addr - 1  (1-based Modbus convention)
+    """
+    if reg_addr >= 40001:
+        return reg_addr - 40001  # 4xxxx Modbus address → 0-based wire offset
+    if zero_based:
+        return reg_addr           # already 0-based
+    return max(0, reg_addr - 1)   # 1-based → 0-based
 
 
 def build_modbus_tcp_read_packet(unit_id=1, func_code=3, start_addr=3355, quantity=1, trans_id=None):
@@ -388,173 +442,304 @@ def ping_local_wifi_device(ip, port, timeout=2.0):
         return False, rtt_ms, str(e)
 
 
-def query_modbus_device(ip, port=502, unit_id=1, func_code=3, reg_addr=3355, quantity=1, value=0, is_write=False, zero_based=True, is_rtu=False, timeout=2.5):
+def query_modbus_device(ip, port=502, unit_id=1, func_code=3, reg_addr=3355, quantity=1, value=0, is_write=False, zero_based=True, is_rtu=False, timeout=5.0, retries=3):
     """
-    Dispatches native Modbus TCP or Modbus RTU-over-TCP request.
+    Dispatches Modbus TCP (MBAP) or Modbus RTU-over-TCP request with automatic retries and fallback,
+    integrating the robust polling, writing, and ACK logic from the Modbus reader module.
     Returns: (success: bool, registers_dict: dict, tx_hex: str, rx_hex: str, rtt_ms: float, error_msg: str, trace_log: str)
     """
     t0 = time.time()
-    wire_addr = (reg_addr - 1) if (zero_based and reg_addr > 0) else reg_addr
-
-    if is_rtu:
-        if is_write:
-            tx_bytes = build_modbus_rtu_packet(unit_id=unit_id, func_code=6, addr=wire_addr, qty_or_val=value)
-            cmd_desc = f"Modbus RTU Write Reg (Unit: {unit_id}, Addr: {reg_addr} -> Wire: {wire_addr}, Val: {value})"
-        else:
-            tx_bytes = build_modbus_rtu_packet(unit_id=unit_id, func_code=func_code, addr=wire_addr, qty_or_val=quantity)
-            cmd_desc = f"Modbus RTU Read Regs (Unit: {unit_id}, Func: {func_code}, Addr: {reg_addr} -> Wire: {wire_addr}, Qty: {quantity})"
-    else:
-        if is_write:
-            tx_bytes, tid = build_modbus_tcp_write_packet(unit_id=unit_id, reg_addr=wire_addr, value=value)
-            cmd_desc = f"Modbus TCP Write Reg (Unit: {unit_id}, Func: 06, Addr: {reg_addr} -> Wire: {wire_addr}, Val: {value}, TID: {tid})"
-        else:
-            tx_bytes, tid = build_modbus_tcp_read_packet(unit_id=unit_id, func_code=func_code, start_addr=wire_addr, quantity=quantity)
-            cmd_desc = f"Modbus TCP Read Regs (Unit: {unit_id}, Func: 0{func_code}, Addr: {reg_addr} -> Wire: {wire_addr}, Qty: {quantity}, TID: {tid})"
-
-    tx_hex = " ".join(f"{b:02X}" for b in tx_bytes)
+    wire_addr = calc_wire_addr(reg_addr, zero_based)
     now_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    modes_to_try = [is_rtu, not is_rtu]
+    last_err = ""
+    last_tx_hex = ""
+    last_rx_hex = ""
+    accumulated_trace = []
 
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, int(port)))
-        s.sendall(tx_bytes)
-        rx_bytes = s.recv(1024)
-        s.close()
-        rtt_ms = round((time.time() - t0) * 1000.0, 1)
-        rx_hex = " ".join(f"{b:02X}" for b in rx_bytes)
-
-        if is_rtu:
-            ok, regs, desc, fc, exc = parse_modbus_rtu_response(rx_bytes, start_reg=reg_addr)
+    for mode in modes_to_try:
+        current_is_rtu = mode
+        if current_is_rtu:
+            if is_write:
+                tx_bytes = build_modbus_rtu_packet(unit_id=unit_id, func_code=6, addr=wire_addr, qty_or_val=value)
+                cmd_desc = f"Modbus RTU Write Reg (Unit: {unit_id}, Func: 06, Addr: {reg_addr} -> Wire: {wire_addr}, Val: {value})"
+            else:
+                tx_bytes = build_modbus_rtu_packet(unit_id=unit_id, func_code=func_code, addr=wire_addr, qty_or_val=quantity)
+                cmd_desc = f"Modbus RTU Read Regs (Unit: {unit_id}, Func: 0{func_code}, Addr: {reg_addr} -> Wire: {wire_addr}, Qty: {quantity})"
         else:
-            ok, regs, desc, fc, exc = parse_modbus_tcp_response(rx_bytes, start_reg=reg_addr)
+            if is_write:
+                tx_bytes, tid = build_modbus_tcp_write_packet(unit_id=unit_id, reg_addr=wire_addr, value=value)
+                cmd_desc = f"Modbus TCP Write Reg (Unit: {unit_id}, Func: 06, Addr: {reg_addr} -> Wire: {wire_addr}, Val: {value}, TID: {tid})"
+            else:
+                tx_bytes, tid = build_modbus_tcp_read_packet(unit_id=unit_id, func_code=func_code, start_addr=wire_addr, quantity=quantity)
+                cmd_desc = f"Modbus TCP Read Regs (Unit: {unit_id}, Func: 0{func_code}, Addr: {reg_addr} -> Wire: {wire_addr}, Qty: {quantity}, TID: {tid})"
 
-        trace = (
-            f"[{now_str}] >>> MODBUS TX -> {ip}:{port}\n"
-            f"  Command : {cmd_desc}\n"
-            f"  Raw Hex : [ {tx_hex} ] ({len(tx_bytes)} bytes)\n"
-            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] <<< MODBUS RX <- {ip}:{port} (RTT: {rtt_ms} ms)\n"
-            f"  Raw Hex : [ {rx_hex} ] ({len(rx_bytes)} bytes)\n"
-            f"  Result  : {'SUCCESS' if ok else 'ERROR'} | {desc}\n"
-        )
-        if ok and regs:
-            reg_lines = [f"  Reg {r} = {v} (0x{v:04X})" for r, v in regs.items()]
-            trace += "\n".join(reg_lines) + "\n"
+        tx_hex = " ".join(f"{b:02X}" for b in tx_bytes)
+        last_tx_hex = tx_hex
 
-        return ok, regs, tx_hex, rx_hex, rtt_ms, ("" if ok else desc), trace
+        for attempt in range(1, retries + 1):
+            t_att = time.time()
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.settimeout(timeout)
+                s.connect((ip, int(port)))
+                s.sendall(tx_bytes)
+                rx_bytes = s.recv(1024)
+                s.close()
 
-    except Exception as e:
-        rtt_ms = round((time.time() - t0) * 1000.0, 1)
-        err_str = str(e) or "Timeout / Connection Failed"
-        trace = (
-            f"[{now_str}] >>> MODBUS TX -> {ip}:{port}\n"
-            f"  Command : {cmd_desc}\n"
-            f"  Raw Hex : [ {tx_hex} ] ({len(tx_bytes)} bytes)\n"
-            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] ✗ ERROR <- {ip}:{port} (RTT: {rtt_ms} ms)\n"
-            f"  Failure : {err_str}\n"
-        )
-        return False, {}, tx_hex, "", rtt_ms, err_str, trace
+                rtt_ms = round((time.time() - t_att) * 1000.0, 1)
+                rx_hex = " ".join(f"{b:02X}" for b in rx_bytes)
+                last_rx_hex = rx_hex
 
+                if current_is_rtu:
+                    ok, regs, desc, fc, exc = parse_modbus_rtu_response(rx_bytes, start_reg=reg_addr)
+                else:
+                    ok, regs, desc, fc, exc = parse_modbus_tcp_response(rx_bytes, start_reg=reg_addr)
+
+                if ok:
+                    ack_str = " [ACK RECEIVED]" if is_write else ""
+                    tr = (
+                        f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] >>> MODBUS TX -> {ip}:{port} (Attempt {attempt})\n"
+                        f"  Command : {cmd_desc}\n"
+                        f"  Raw Hex : [ {tx_hex} ] ({len(tx_bytes)} bytes)\n"
+                        f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] <<< MODBUS RX <- {ip}:{port} (RTT: {rtt_ms} ms){ack_str}\n"
+                        f"  Raw Hex : [ {rx_hex} ] ({len(rx_bytes)} bytes)\n"
+                        f"  Result  : SUCCESS | {desc}\n"
+                    )
+                    if regs:
+                        reg_lines = [f"  Reg {r} = {v} (0x{v:04X})" for r, v in regs.items()]
+                        tr += "\n".join(reg_lines) + "\n"
+                    accumulated_trace.append(tr)
+                    return True, regs, tx_hex, rx_hex, rtt_ms, "", "\n".join(accumulated_trace)
+                else:
+                    last_err = desc
+                    accumulated_trace.append(f"[{datetime.now().strftime('%H:%M:%S')}] Attempt {attempt} failed: {desc}")
+            except Exception as e:
+                last_err = str(e) or "Timeout"
+                rtt_ms = round((time.time() - t_att) * 1000.0, 1)
+                accumulated_trace.append(f"[{datetime.now().strftime('%H:%M:%S')}] Attempt {attempt} socket error: {last_err} ({rtt_ms} ms)")
+            time.sleep(0.05)
+
+    total_rtt = round((time.time() - t0) * 1000.0, 1)
+    fail_trace = (
+        f"[{now_str}] >>> MODBUS TX -> {ip}:{port}\n"
+        f"  Raw Hex : [ {last_tx_hex} ]\n"
+        f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] ✗ ERROR <- {ip}:{port} (Total: {total_rtt} ms)\n"
+        f"  Failure : {last_err or 'No response after all attempts'}\n"
+        + "\n".join(accumulated_trace) + "\n"
+    )
+    return False, {}, last_tx_hex, last_rx_hex, total_rtt, last_err, fail_trace
 
 def probe_wifi_device_protocols(ip, default_port=502, timeout=1.5):
     """
     Automatically probes remote WiFi device to detect protocol:
-    1. Modbus TCP on Port 502 / default_port
+    1. Modbus TCP on Port 502 / default_port  (priority)
     2. Modbus TCP on Port 5020 / 8899
     3. Modbus RTU over TCP on Port 502 / 8899
-    4. HTTP API on Port 80 / 8080
+    NOTE: HTTP is NOT used as a Modbus transport — the ESP32 HTTP server on
+          port 80 is a web UI only, not a Modbus endpoint.
     Returns: (found: bool, detected_proto: str, working_port: int, slave_id: int, rtt_ms: float, details: str)
     """
-    ports_to_try = [int(default_port)] if int(default_port) not in [502, 80] else []
-    ports_to_try.extend([502, 80, 8080, 8899, 5020])
-    ports_to_try = list(dict.fromkeys(ports_to_try))
+    # Only probe Modbus ports — NEVER fall through to HTTP as a Modbus transport
+    modbus_ports = []
+    if int(default_port) not in [502, 5020, 8899]:
+        modbus_ports.append(int(default_port))
+    modbus_ports.extend([502, 5020, 8899])
+    modbus_ports = list(dict.fromkeys(modbus_ports))
 
-    # 1. Try Modbus TCP
-    for p in ports_to_try:
+    # 1. Try Modbus TCP (Func 03 and Func 04) on each port
+    for p in modbus_ports:
         for uid in (1, 255, 0):
-            ok, regs, tx, rx, rtt, err, tr = query_modbus_device(ip, port=p, unit_id=uid, func_code=3, reg_addr=3355, quantity=1, zero_based=True, is_rtu=False, timeout=timeout)
+            ok, regs, tx, rx, rtt, err, tr = query_modbus_device(
+                ip, port=p, unit_id=uid, func_code=3, reg_addr=3355,
+                quantity=1, zero_based=True, is_rtu=False, timeout=timeout
+            )
             if ok or (rx and len(rx) >= 9):
-                return True, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", p, uid, rtt, f"Modbus TCP detected on Port {p} (Unit ID {uid}, RTT {rtt} ms)"
-            ok4, regs4, tx4, rx4, rtt4, err4, tr4 = query_modbus_device(ip, port=p, unit_id=uid, func_code=4, reg_addr=3355, quantity=1, zero_based=True, is_rtu=False, timeout=timeout)
+                return True, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", p, uid, rtt, \
+                    f"Modbus TCP detected on Port {p} (Unit ID {uid}, RTT {rtt} ms)"
+            ok4, regs4, tx4, rx4, rtt4, err4, tr4 = query_modbus_device(
+                ip, port=p, unit_id=uid, func_code=4, reg_addr=3355,
+                quantity=1, zero_based=True, is_rtu=False, timeout=timeout
+            )
             if ok4 or (rx4 and len(rx4) >= 9):
-                return True, "Modbus TCP/IP (Port 502 - Func 04 Input Regs)", p, uid, rtt4, f"Modbus TCP (Func 04) detected on Port {p} (Unit ID {uid}, RTT {rtt4} ms)"
+                return True, "Modbus TCP/IP (Port 502 - Func 04 Input Regs)", p, uid, rtt4, \
+                    f"Modbus TCP (Func 04) detected on Port {p} (Unit ID {uid}, RTT {rtt4} ms)"
 
     # 2. Try Modbus RTU over TCP
     for p in [502, 8899]:
-        ok, regs, tx, rx, rtt, err, tr = query_modbus_device(ip, port=p, unit_id=1, func_code=3, reg_addr=3355, quantity=1, is_rtu=True, timeout=timeout)
+        ok, regs, tx, rx, rtt, err, tr = query_modbus_device(
+            ip, port=p, unit_id=1, func_code=3, reg_addr=3355,
+            quantity=1, is_rtu=True, timeout=timeout
+        )
         if ok:
-            return True, "Modbus RTU over TCP (Port 502 / 8899)", p, 1, rtt, f"Modbus RTU over TCP detected on Port {p} (RTT {rtt} ms)"
+            return True, "Modbus RTU over TCP (Port 502 / 8899)", p, 1, rtt, \
+                f"Modbus RTU over TCP detected on Port {p} (RTT {rtt} ms)"
 
-    # 3. Try HTTP
-    for p in [80, 8080]:
-        try:
-            t0 = time.time()
-            req = urllib.request.Request(f"http://{ip}:{p}/", headers={'User-Agent': 'ModbusProbe'}, method='GET')
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                rtt = round((time.time() - t0) * 1000.0, 1)
-                return True, "HTTP POST (/ondemand)", p, 1, rtt, f"HTTP Server detected on Port {p} (Status {resp.status}, RTT {rtt} ms)"
-        except Exception:
-            pass
-
-    # 4. Fallback TCP Ping
-    for p in ports_to_try:
+    # 3. Fallback: TCP port-open check (still report as Modbus, not HTTP)
+    for p in modbus_ports:
         ok_ping, rtt_ping, _ = ping_local_wifi_device(ip, p, timeout=timeout)
         if ok_ping:
-            return True, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", p, 1, rtt_ping, f"TCP Port {p} is OPEN! Connected as Modbus TCP (RTT {rtt_ping} ms)"
+            return True, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", p, 1, rtt_ping, \
+                f"TCP Port {p} is OPEN — treating as Modbus TCP (RTT {rtt_ping} ms)"
 
-    return False, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", 502, 1, 0.0, f"No responding Modbus or HTTP services found on {ip}"
+    return False, "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)", 502, 1, 0.0, \
+        f"No responding Modbus service found on {ip} (checked ports: {modbus_ports})"
 
 
 def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_based=True, timeout=3.5):
     """
-    Dispatches query to a local WiFi device via Modbus TCP, Modbus RTU over TCP, HTTP POST, HTTP GET, or TCP Socket.
-    Returns: (success: bool, response_dict: dict, raw_text: str, rtt_ms: float, error_msg: str, trace_log: str)
+    Dispatches a query to a local WiFi Modbus device using the pure-socket Modbus TCP/RTU
+    protocol engine from modbus_poll_3.py.
+
+    The payload_dict carries the MQTT-side register description (msgid, CMKEY, PMKEY,
+    timestamp, cmd, and register-number keys).  This function converts those into
+    actual Modbus TCP/RTU wire frames — it does NOT send JSON over port 502.
+
+    Returns: (success: bool, response_dict: dict, raw_hex: str, rtt_ms: float,
+              error_msg: str, trace_log: str)
     """
     proto_up = protocol.upper()
+    t0 = time.time()
 
-    # 1. Modbus TCP or RTU over TCP
+    # ── 1. Modbus TCP / RTU over TCP (the ONLY transport for port 502) ──────────
     if "MODBUS" in proto_up:
-        is_rtu = "RTU" in proto_up
+        is_rtu    = "RTU" in proto_up
         func_code = 4 if ("04" in proto_up or "INPUT" in proto_up) else 3
-        cmd = payload_dict.get("cmd", "read").lower()
-        is_write = (cmd == "write")
+        cmd       = payload_dict.get("cmd", "read").lower()
+        is_write  = (cmd == "write")
 
-        # Extract register number and value from payload
-        reg_num = 3355
-        reg_val = 0
-        for k, v in payload_dict.items():
-            if k not in ["msgid", "CMKEY", "PMKEY", "timestamp", "type", "cmd"]:
+        # --- Extract register address(es) and write value from the payload dict ---
+        # Payload keys that are pure integers are register numbers;
+        # their values are the data to write (for write cmd) or don't-care (for read).
+        SKIP_KEYS = {"msgid", "CMKEY", "PMKEY", "timestamp", "type", "cmd"}
+        reg_keys = []
+        for k in payload_dict:
+            if k not in SKIP_KEYS:
                 try:
-                    reg_num = int(k)
-                    reg_val = int(v) if str(v).isdigit() else 0
-                    break
-                except ValueError:
+                    reg_keys.append(int(k))
+                except (ValueError, TypeError):
                     pass
 
-        # Check if multiple registers in batch read
-        reg_keys = [int(k) for k in payload_dict.keys() if k not in ["msgid", "CMKEY", "PMKEY", "timestamp", "type", "cmd"] and str(k).isdigit()]
-        if len(reg_keys) > 1 and not is_write:
-            min_r = min(reg_keys)
-            max_r = max(reg_keys)
-            qty = max(1, min(max_r - min_r + 1, 125))
-            ok, regs, tx, rx, rtt, err, trace = query_modbus_device(
-                ip, port=int(port), unit_id=unit_id, func_code=func_code,
-                reg_addr=min_r, quantity=qty, value=0, is_write=False,
-                zero_based=zero_based, is_rtu=is_rtu, timeout=timeout
-            )
-            filtered_regs = {str(k): regs.get(str(k), 1) for k in reg_keys} if ok else {}
-            return ok, filtered_regs, (rx or tx), rtt, err, trace
-        else:
-            ok, regs, tx, rx, rtt, err, trace = query_modbus_device(
-                ip, port=int(port), unit_id=unit_id, func_code=func_code,
-                reg_addr=reg_num, quantity=1, value=reg_val, is_write=is_write,
-                zero_based=zero_based, is_rtu=is_rtu, timeout=timeout
-            )
-            return ok, regs, (rx or tx), rtt, err, trace
+        if not reg_keys:
+            reg_keys = [3355]   # safe fallback
 
-    # 2. HTTP POST
+        reg_keys.sort()
+        reg_num = reg_keys[0]
+        reg_val = 0
+        try:
+            reg_val = int(payload_dict.get(str(reg_num), 0))
+        except (ValueError, TypeError):
+            reg_val = 0
+
+        trace_lines = [
+            f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] "
+            f"{'>>> MODBUS RTU' if is_rtu else '>>> MODBUS TCP'} "
+            f"{'WRITE' if is_write else 'READ'} "
+            f"-> {ip}:{port} | Unit:{unit_id} | "
+            f"Reg{'s' if len(reg_keys)>1 else ''}:{reg_keys} | "
+            f"{'Val:'+str(reg_val) if is_write else 'Func:0'+str(func_code)}"
+        ]
+
+        # ── WRITE path ────────────────────────────────────────────────────────
+        if is_write:
+            wire_addr = calc_wire_addr(reg_num, zero_based)
+            trace_lines.append(
+                f"  Wire addr: {wire_addr} (Modbus addr {reg_num}, "
+                f"{'0-based' if zero_based else '1-based'})"
+            )
+            ok, regs, tx_hex, rx_hex, rtt, err, inner_trace = query_modbus_device(
+                ip, port=int(port), unit_id=unit_id,
+                func_code=func_code, reg_addr=reg_num,
+                quantity=1, value=reg_val,
+                is_write=True, zero_based=zero_based,
+                is_rtu=is_rtu, timeout=timeout
+            )
+            trace_lines.append(inner_trace)
+            full_trace = "\n".join(trace_lines) + "\n"
+            return ok, regs, (rx_hex or tx_hex), rtt, err, full_trace
+
+        # ── READ path: single register ────────────────────────────────────────
+        if len(reg_keys) == 1:
+            wire_addr = calc_wire_addr(reg_num, zero_based)
+            trace_lines.append(f"  Wire addr: {wire_addr}")
+            ok, regs, tx_hex, rx_hex, rtt, err, inner_trace = query_modbus_device(
+                ip, port=int(port), unit_id=unit_id,
+                func_code=func_code, reg_addr=reg_num,
+                quantity=1, value=0,
+                is_write=False, zero_based=zero_based,
+                is_rtu=is_rtu, timeout=timeout
+            )
+            trace_lines.append(inner_trace)
+            full_trace = "\n".join(trace_lines) + "\n"
+            return ok, regs, (rx_hex or tx_hex), rtt, err, full_trace
+
+        # ── READ path: batch — use SocketModbusClient from modbus_poll_3 ──────
+        # Covers all requested registers in minimal number of Modbus frames
+        min_r = reg_keys[0]
+        max_r = reg_keys[-1]
+        qty   = max(1, min(max_r - min_r + 1, 125))
+        wire_start = calc_wire_addr(min_r, zero_based)
+        trace_lines.append(
+            f"  Batch read: wire {wire_start}..{wire_start+qty-1} "
+            f"(registers {min_r}..{max_r}, qty={qty})"
+        )
+
+        if _MODBUS_LIB_OK and _SocketModbusClient is not None:
+            # Use library's SocketModbusClient for multi-chunk batch polling
+            client = _SocketModbusClient(
+                host=ip, port=int(port), timeout=timeout, is_rtu=is_rtu
+            )
+            if not client.connect():
+                rtt = round((time.time() - t0) * 1000.0, 1)
+                err = f"Could not connect to {ip}:{port}"
+                trace_lines.append(f"  [✗] {err} ({rtt} ms)")
+                return False, {}, "", rtt, err, "\n".join(trace_lines) + "\n"
+
+            raw_values = _modbus_read_registers(
+                client, start=wire_start,
+                end=wire_start + qty - 1,
+                reg_type="holding" if func_code == 3 else "input",
+                slave_id=unit_id,
+                chunk_size=min(100, qty)
+            )
+            client.close()
+            rtt = round((time.time() - t0) * 1000.0, 1)
+
+            # Map raw values back to register numbers
+            regs = {}
+            for i, v in enumerate(raw_values):
+                rn = str(min_r + i)
+                regs[rn] = v if v is not None else 0
+
+            # Only keep the registers that were requested
+            filtered = {str(k): regs.get(str(k), 0) for k in reg_keys}
+
+            reg_lines = [f"  Reg {r} = {v} (0x{v:04X})" for r, v in filtered.items() if isinstance(v, int)]
+            trace_lines.append(
+                f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] <<< "
+                f"MODBUS BATCH READ COMPLETE | {len(filtered)} regs | RTT: {rtt} ms"
+            )
+            trace_lines.extend(reg_lines)
+            full_trace = "\n".join(trace_lines) + "\n"
+            return True, filtered, f"batch:{len(filtered)}", rtt, "", full_trace
+        else:
+            # Fallback: single sequential query_modbus_device calls
+            wire_addr = calc_wire_addr(min_r, zero_based)
+            ok, regs, tx_hex, rx_hex, rtt, err, inner_trace = query_modbus_device(
+                ip, port=int(port), unit_id=unit_id,
+                func_code=func_code, reg_addr=min_r,
+                quantity=qty, value=0,
+                is_write=False, zero_based=zero_based,
+                is_rtu=is_rtu, timeout=timeout
+            )
+            filtered = {str(k): regs.get(str(k), 0) for k in reg_keys} if ok else {}
+            trace_lines.append(inner_trace)
+            full_trace = "\n".join(trace_lines) + "\n"
+            return ok, filtered, (rx_hex or tx_hex), rtt, err, full_trace
+
+    # ── 2. HTTP POST ─────────────────────────────────────────────────────────────
     elif "POST" in proto_up:
-        t0 = time.time()
         payload_json = json.dumps(payload_dict)
         url = f"http://{ip}:{port}/ondemand"
         req = urllib.request.Request(
@@ -566,9 +751,10 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_ba
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw_bytes = resp.read()
-                raw_text = raw_bytes.decode('utf-8', errors='replace')
-                rtt_ms = round((time.time() - t0) * 1000.0, 1)
-                trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP POST {url} -> 200 OK ({rtt_ms} ms)\nResponse: {raw_text}\n"
+                raw_text  = raw_bytes.decode('utf-8', errors='replace')
+                rtt_ms    = round((time.time() - t0) * 1000.0, 1)
+                trace = (f"[{datetime.now().strftime('%H:%M:%S')}] HTTP POST {url} -> "
+                         f"200 OK ({rtt_ms} ms)\nResponse: {raw_text}\n")
                 try:
                     data = json.loads(raw_text)
                     return True, data, raw_text, rtt_ms, "", trace
@@ -576,22 +762,23 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_ba
                     return True, {}, raw_text, rtt_ms, "", trace
         except Exception as e:
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP POST {url} -> Failed: {e} ({rtt_ms} ms)\n"
+            trace  = (f"[{datetime.now().strftime('%H:%M:%S')}] HTTP POST {url} -> "
+                      f"Failed: {e} ({rtt_ms} ms)\n")
             return False, {}, "", rtt_ms, str(e), trace
 
-    # 3. HTTP GET
+    # ── 3. HTTP GET ───────────────────────────────────────────────────────────────
     elif "GET" in proto_up:
-        t0 = time.time()
-        params = [f"{k}={urllib.parse.quote(str(v))}" for k, v in payload_dict.items()]
+        params    = [f"{k}={urllib.parse.quote(str(v))}" for k, v in payload_dict.items()]
         query_str = "&".join(params)
-        url = f"http://{ip}:{port}/ondemand?{query_str}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'MQTT-SCADA-Controller/2.0'}, method='GET')
+        url       = f"http://{ip}:{port}/ondemand?{query_str}"
+        req       = urllib.request.Request(url, headers={'User-Agent': 'MQTT-SCADA-Controller/2.0'}, method='GET')
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw_bytes = resp.read()
-                raw_text = raw_bytes.decode('utf-8', errors='replace')
-                rtt_ms = round((time.time() - t0) * 1000.0, 1)
-                trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP GET {url} -> 200 OK ({rtt_ms} ms)\nResponse: {raw_text}\n"
+                raw_text  = raw_bytes.decode('utf-8', errors='replace')
+                rtt_ms    = round((time.time() - t0) * 1000.0, 1)
+                trace = (f"[{datetime.now().strftime('%H:%M:%S')}] HTTP GET {url} -> "
+                         f"200 OK ({rtt_ms} ms)\nResponse: {raw_text}\n")
                 try:
                     data = json.loads(raw_text)
                     return True, data, raw_text, rtt_ms, "", trace
@@ -599,12 +786,12 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_ba
                     return True, {}, raw_text, rtt_ms, "", trace
         except Exception as e:
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            trace = f"[{datetime.now().strftime('%H:%M:%S')}] HTTP GET {url} -> Failed: {e} ({rtt_ms} ms)\n"
+            trace  = (f"[{datetime.now().strftime('%H:%M:%S')}] HTTP GET {url} -> "
+                      f"Failed: {e} ({rtt_ms} ms)\n")
             return False, {}, "", rtt_ms, str(e), trace
 
-    # 4. TCP Direct Socket (JSON)
+    # ── 4. TCP Direct Socket (raw JSON) ──────────────────────────────────────────
     else:
-        t0 = time.time()
         payload_json = json.dumps(payload_dict)
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -613,9 +800,10 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_ba
             s.sendall((payload_json + "\n").encode('utf-8'))
             resp_bytes = s.recv(4096)
             s.close()
-            rtt_ms = round((time.time() - t0) * 1000.0, 1)
+            rtt_ms   = round((time.time() - t0) * 1000.0, 1)
             raw_text = resp_bytes.decode('utf-8', errors='replace')
-            trace = f"[{datetime.now().strftime('%H:%M:%S')}] TCP Direct -> {ip}:{port} ({rtt_ms} ms)\nResponse: {raw_text}\n"
+            trace    = (f"[{datetime.now().strftime('%H:%M:%S')}] TCP Direct -> "
+                        f"{ip}:{port} ({rtt_ms} ms)\nResponse: {raw_text}\n")
             try:
                 data = json.loads(raw_text.strip())
                 return True, data, raw_text, rtt_ms, "", trace
@@ -623,7 +811,8 @@ def query_local_wifi_device(ip, port, protocol, payload_dict, unit_id=1, zero_ba
                 return True, {}, raw_text, rtt_ms, "", trace
         except Exception as e:
             rtt_ms = round((time.time() - t0) * 1000.0, 1)
-            trace = f"[{datetime.now().strftime('%H:%M:%S')}] TCP Direct {ip}:{port} -> Failed: {e} ({rtt_ms} ms)\n"
+            trace  = (f"[{datetime.now().strftime('%H:%M:%S')}] TCP Direct {ip}:{port} -> "
+                      f"Failed: {e} ({rtt_ms} ms)\n")
             return False, {}, "", rtt_ms, str(e), trace
 
 # ==============================================================================
@@ -1398,6 +1587,28 @@ def launch_gui(initial_config=None):
     subscribed_topics_map = {}  # {topic: {"qos": qos, "packets": 0, "status": "Subscribed"}}
     last_dispatch_meta = {"topic": "", "payload": "", "time": 0, "time_str": ""}
 
+    # Global UI handles for Tab 2 and closures
+    tree_wifi_regs = None
+    txt_wifi_console = None
+    lbl_wifi_recv_info = None
+    lbl_wifi_recv_payload = None
+    lbl_wifi_pub_info = None
+    lbl_wifi_pub_payload = None
+    entry_wifi_ip = None
+    entry_wifi_port = None
+    entry_wifi_unit_id = None
+    combo_wifi_proto = None
+    var_wifi_zero_based = None
+    lbl_wifi_selection_count = None
+    lbl_wifi_payload_preview = None
+    lbl_wifi_reg_count = None
+    lbl_wifi_ping_res = None
+    entry_wifi_reg_num_dyn = None
+    entry_wifi_reg_val_dyn = None
+    entry_wifi_cmkey_dyn = None
+    entry_wifi_pmkey_dyn = None
+    combo_wifi_cmd_dyn = None
+
     # Restore broker config from app_state if present
     init_host = saved_state.get("broker_host") or broker_cfg.get("host", "rms.iotscada-pmsg.com")
     init_port = str(saved_state.get("broker_port") or broker_cfg.get("port", 8883))
@@ -1575,7 +1786,7 @@ def launch_gui(initial_config=None):
 
     ttk.Label(p_pub_header, text="Publish Topic:").pack(side=tk.LEFT, padx=(6, 2))
     entry_pub_topic_tab1 = ttk.Entry(p_pub_header, width=38, font=("Consolas", 8))
-    entry_pub_topic_tab1.insert(0, saved_state.get("publish_topic", f"rtsg-1/ongridrooftop/{init_imei}/ondemand/sub"))
+    entry_pub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{init_imei}/ondemand/sub")
     entry_pub_topic_tab1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
     def on_imei_changed(*args):
@@ -1583,6 +1794,9 @@ def launch_gui(initial_config=None):
         if imei_val:
             entry_pub_topic_tab1.delete(0, tk.END)
             entry_pub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{imei_val}/ondemand/sub")
+            if 'entry_sub_imei_dyn' in locals() and entry_sub_imei_dyn.get().strip() != imei_val:
+                entry_sub_imei_dyn.delete(0, tk.END)
+                entry_sub_imei_dyn.insert(0, imei_val)
             if 'entry_sub_topic_tab1' in locals():
                 entry_sub_topic_tab1.delete(0, tk.END)
                 entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{imei_val}/#")
@@ -1605,7 +1819,7 @@ def launch_gui(initial_config=None):
 
     lbl_wifi_quick_info = ttk.Label(
         p_transport_header,
-        text=f"(Target: {saved_state.get('wifi_device_ip', '192.168.4.1')}:{saved_state.get('wifi_device_port', 80)})",
+        text=f"(Target: {saved_state.get('wifi_device_ip', '192.168.4.1')}:{saved_state.get('wifi_device_port', 502)})",
         font=("Consolas", 8, "italic"),
         foreground="#0d47a1"
     )
@@ -1769,19 +1983,84 @@ def launch_gui(initial_config=None):
     f_right_container = ttk.LabelFrame(paned_main, text="3. Subscribed Topics & Live Response Stream (Receive)", padding=6)
     paned_main.add(f_right_container, weight=2)
 
-    # Top Section: Auto-Subscribe Wildcard Button
+    # Row 0: Subscribed Target IMEI Input & Sync Control
+    f_sub_imei_row = ttk.Frame(f_right_container)
+    f_sub_imei_row.pack(fill=tk.X, pady=(0, 2))
+
+    ttk.Label(f_sub_imei_row, text="Sub IMEI:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(1, 2))
+    entry_sub_imei_dyn = ttk.Entry(f_sub_imei_row, width=17, font=("Consolas", 9, "bold"))
+    entry_sub_imei_dyn.insert(0, init_imei)
+    entry_sub_imei_dyn.pack(side=tk.LEFT, padx=1)
+
+    def on_sub_imei_changed(*args):
+        s_val = entry_sub_imei_dyn.get().strip()
+        if s_val:
+            if 'entry_imei_dyn' in locals() and entry_imei_dyn.get().strip() != s_val:
+                entry_imei_dyn.delete(0, tk.END)
+                entry_imei_dyn.insert(0, s_val)
+            if 'entry_pub_topic_tab1' in locals():
+                entry_pub_topic_tab1.delete(0, tk.END)
+                entry_pub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{s_val}/ondemand/sub")
+            entry_sub_topic_tab1.delete(0, tk.END)
+            entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{s_val}/#")
+            if len(s_val) >= 10:
+                set_dynamic_imei_topics(s_val)
+            update_payload_preview()
+
+    entry_sub_imei_dyn.bind("<KeyRelease>", on_sub_imei_changed)
+
+    def sync_all_imei_topics():
+        cur_imei = entry_sub_imei_dyn.get().strip() or entry_imei_dyn.get().strip() or init_imei
+        if 'entry_imei_dyn' in locals():
+            entry_imei_dyn.delete(0, tk.END)
+            entry_imei_dyn.insert(0, cur_imei)
+        entry_sub_imei_dyn.delete(0, tk.END)
+        entry_sub_imei_dyn.insert(0, cur_imei)
+        entry_pub_topic_tab1.delete(0, tk.END)
+        entry_pub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{cur_imei}/ondemand/sub")
+        entry_sub_topic_tab1.delete(0, tk.END)
+        entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{cur_imei}/#")
+        set_dynamic_imei_topics(cur_imei)
+        update_payload_preview()
+
+    btn_sync_imeis = ttk.Button(f_sub_imei_row, text="🔄 Sync All Topics", command=sync_all_imei_topics)
+    btn_sync_imeis.pack(side=tk.LEFT, padx=3)
+
+    # Row 0.5: Quick Sub Topic Template Buttons
+    f_sub_quick_tpl = ttk.Frame(f_right_container)
+    f_sub_quick_tpl.pack(fill=tk.X, pady=(1, 2))
+
+    ttk.Label(f_sub_quick_tpl, text="Quick Sub:", font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(1, 2))
+
+    def set_and_subscribe_tpl(tpl_name):
+        cur = entry_sub_imei_dyn.get().strip() or entry_imei_dyn.get().strip() or init_imei
+        top = f"rtsg-1/ongridrooftop/{cur}/{tpl_name}"
+        entry_sub_topic_tab1.delete(0, tk.END)
+        entry_sub_topic_tab1.insert(0, top)
+        add_custom_subscription(topic_to_sub=top)
+
+    ttk.Button(f_sub_quick_tpl, text="# (All)", command=lambda: set_and_subscribe_tpl("#")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="+/+", command=lambda: set_and_subscribe_tpl("+/+")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="ondemand/pub", command=lambda: set_and_subscribe_tpl("ondemand/pub")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="data/pub", command=lambda: set_and_subscribe_tpl("data/pub")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="info/sub", command=lambda: set_and_subscribe_tpl("info/sub")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="messagekey/sub", command=lambda: set_and_subscribe_tpl("messagekey/sub")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="config/pub", command=lambda: set_and_subscribe_tpl("config/pub")).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_sub_quick_tpl, text="rtevent/pub", command=lambda: set_and_subscribe_tpl("rtevent/pub")).pack(side=tk.LEFT, padx=1)
+
     btn_auto_sub = tk.Button(
         f_right_container,
         text="⚡ AUTO-SUBSCRIBE ALL TARGET DEVICE TOPICS (#)",
+        command=lambda: set_dynamic_imei_topics(entry_sub_imei_dyn.get().strip() or entry_imei_dyn.get().strip()),
         font=("Segoe UI", 9, "bold"),
         bg="#007bff",
         fg="white",
         relief=tk.RAISED,
         bd=2,
         padx=10,
-        pady=4
+        pady=3
     )
-    btn_auto_sub.pack(fill=tk.X, pady=(0, 4))
+    btn_auto_sub.pack(fill=tk.X, pady=(1, 3))
 
     # Add & Manage Subscription Controls
     f_sub_ctrl = ttk.Frame(f_right_container)
@@ -1789,7 +2068,7 @@ def launch_gui(initial_config=None):
 
     ttk.Label(f_sub_ctrl, text="Sub:").pack(side=tk.LEFT, padx=1)
     entry_sub_topic_tab1 = ttk.Entry(f_sub_ctrl, font=("Consolas", 8))
-    entry_sub_topic_tab1.insert(0, saved_state.get("subscribe_topic", f"rtsg-1/ongridrooftop/{init_imei}/#"))
+    entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{init_imei}/#")
     entry_sub_topic_tab1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
     ttk.Label(f_sub_ctrl, text="QoS:").pack(side=tk.LEFT, padx=1)
@@ -1956,7 +2235,7 @@ def launch_gui(initial_config=None):
         selected = tree_regs.selection()
         cnt = len(selected)
         lbl_selection_count.config(text=f"{cnt} registers selected for batch")
-        if 'lbl_wifi_selection_count' in locals():
+        if lbl_wifi_selection_count is not None:
             lbl_wifi_selection_count.config(text=f"{cnt} registers selected for batch")
         if cnt == 1:
             item = tree_regs.item(selected[0]) if tree_regs.exists(selected[0]) else (tree_wifi_regs.item(selected[0]) if ('tree_wifi_regs' in locals() and tree_wifi_regs is not None and tree_wifi_regs.exists(selected[0])) else {})
@@ -1967,7 +2246,7 @@ def launch_gui(initial_config=None):
                 entry_reg_num_dyn.delete(0, tk.END)
                 entry_reg_num_dyn.insert(0, r_addr)
                 lbl_reg_name_hint.config(text=f"[{r_name}]")
-                if 'entry_wifi_reg_num_dyn' in locals():
+                if entry_wifi_reg_num_dyn is not None:
                     entry_wifi_reg_num_dyn.delete(0, tk.END)
                     entry_wifi_reg_num_dyn.insert(0, r_addr)
                     lbl_wifi_reg_name_hint.config(text=f"[{r_name}]")
@@ -2049,8 +2328,39 @@ def launch_gui(initial_config=None):
         else:
             preview_disp = p_str
         lbl_payload_preview.config(text=f"Payload: {preview_disp}")
-        if 'lbl_wifi_payload_preview' in locals():
-            lbl_wifi_payload_preview.config(text=f"Payload: {preview_disp}")
+
+        # Tab 2: Display pure Modbus Protocol Frame (Unit ID, Func Code, Wire Addr) rather than MQTT JSON
+        if lbl_wifi_payload_preview is not None:
+            w_uid = int((entry_wifi_unit_id.get().strip() if entry_wifi_unit_id else "") or 1)
+            w_zb  = var_wifi_zero_based.get() if var_wifi_zero_based is not None else True
+            if len(selected) > 1:
+                b_keys = sorted([int(k) for k in (batch_dict if 'batch_dict' in locals() else {}) if str(k).isdigit()])
+                if b_keys:
+                    min_k = b_keys[0]
+                    max_k = b_keys[-1]
+                    qty = max_k - min_k + 1
+                    wire_k = calc_wire_addr(min_k, w_zb)
+                    lbl_wifi_payload_preview.config(
+                        text=f"Modbus Frame: [MBAP Unit:{w_uid}] [PDU Func:03 (Read) | Wire Addr:{wire_k}..{wire_k+qty-1} | Qty:{qty} ({len(b_keys)} regs)]",
+                        fg="#1b5e20", bg="#e8f5e9"
+                    )
+            else:
+                try:
+                    rn_int = int(r_num)
+                    wire_addr = calc_wire_addr(rn_int, w_zb)
+                except ValueError:
+                    wire_addr = 0
+                if cmd_val == "write":
+                    val_int = int(r_val) if str(r_val).isdigit() else 0
+                    lbl_wifi_payload_preview.config(
+                        text=f"Modbus Frame: [MBAP Unit:{w_uid}] [PDU Func:06 (Write) | Wire Addr:{wire_addr} (Reg {r_num}) | Val:{val_int}] -> Awaiting Device Echo ACK",
+                        fg="#b71c1c", bg="#ffebee"
+                    )
+                else:
+                    lbl_wifi_payload_preview.config(
+                        text=f"Modbus Frame: [MBAP Unit:{w_uid}] [PDU Func:03 (Read) | Wire Addr:{wire_addr} (Reg {r_num}) | Qty:1]",
+                        fg="#0d47a1", bg="#e8eaf6"
+                    )
         return payload_obj
 
     # Key bindings for preview updates
@@ -2060,23 +2370,23 @@ def launch_gui(initial_config=None):
     combo_cmd_dyn.bind("<<ComboboxSelected>>", update_payload_preview)
 
     def dispatch_wifi_fetch(batch=False):
-        """Dispatches ondemand register query directly to the Local WiFi device."""
-        w_ip = saved_state.get("wifi_device_ip", "192.168.4.1")
-        w_port = saved_state.get("wifi_device_port", 80)
-        w_proto = saved_state.get("wifi_protocol", "HTTP POST (/ondemand)")
-        try:
-            if 'entry_wifi_ip' in locals():
-                w_ip = entry_wifi_ip.get().strip() or w_ip
-            if 'entry_wifi_port' in locals():
-                w_port = int(entry_wifi_port.get().strip() or w_port)
-            if 'combo_wifi_proto' in locals():
-                w_proto = combo_wifi_proto.get().strip() or w_proto
-        except Exception:
-            pass
+        """
+        Dispatches ondemand register query directly to the Local WiFi device,
+        incorporating the polling, writing, and ACK logic from the Modbus reader module.
+        """
+        w_ip = (entry_wifi_ip.get().strip() if entry_wifi_ip else "") or saved_state.get("wifi_device_ip", "192.168.4.1")
+        w_port = int((entry_wifi_port.get().strip() if entry_wifi_port else "") or saved_state.get("wifi_device_port", 502))
+        w_proto = (combo_wifi_proto.get().strip() if combo_wifi_proto else "") or saved_state.get("wifi_protocol", "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)")
+        w_unit_id = int((entry_wifi_unit_id.get().strip() if entry_wifi_unit_id else "") or saved_state.get("wifi_slave_id", 1))
+        w_zero_based = var_wifi_zero_based.get() if var_wifi_zero_based is not None else saved_state.get("wifi_zero_based", True)
 
-        cm = entry_cmkey_dyn.get().strip() or LIVE_KEYS.get("CMKEY", "155521")
-        pm = entry_pmkey_dyn.get().strip() or LIVE_KEYS.get("PMKEY", "438266")
-        cmd_val = combo_cmd_dyn.get().strip() or "read"
+        cm = (entry_cmkey_dyn.get().strip() if entry_cmkey_dyn else "") or LIVE_KEYS.get("CMKEY", "155521")
+        pm = (entry_pmkey_dyn.get().strip() if entry_pmkey_dyn else "") or LIVE_KEYS.get("PMKEY", "438266")
+        cmd_val = (combo_cmd_dyn.get().strip() if combo_cmd_dyn else "") or "read"
+
+        batch_dict = {}
+        r_num = "3355"
+        r_val = 0
 
         if batch:
             batch_dict = get_selected_registers_dict()
@@ -2084,65 +2394,110 @@ def launch_gui(initial_config=None):
                 messagebox.showinfo("Batch Selection", "No registers found in the current view to batch.")
                 return
             payload_obj = build_ondemand_payload(batch_dict=batch_dict, cmkey=cm, pmkey=pm, cmd=cmd_val)
-            desc = f"Batch of {len(batch_dict)} registers"
+            desc = f"Batch of {len(batch_dict)} registers ({cmd_val.upper()})"
         else:
-            r_num = entry_reg_num_dyn.get().strip() or "3355"
-            r_val_raw = entry_reg_val_dyn.get().strip() or "0"
+            r_num = (entry_reg_num_dyn.get().strip() if entry_reg_num_dyn else "") or "3355"
+            r_val_raw = (entry_reg_val_dyn.get().strip() if entry_reg_val_dyn else "") or "0"
             r_val = int(r_val_raw) if r_val_raw.isdigit() else r_val_raw
             payload_obj = build_ondemand_payload(r_num, r_val, cmkey=cm, pmkey=pm, cmd=cmd_val)
-            desc = f"Register [{r_num}] = {r_val}"
+            desc = f"Register [{r_num}] = {r_val} ({cmd_val.upper()})"
 
-        payload_json = json.dumps(payload_obj)
-        target_top = f"WiFi://{w_ip}:{w_port}/ondemand"
+        is_modbus = "MODBUS" in w_proto.upper()
         now_str = datetime.now().strftime("%H:%M:%S")
 
+        if is_modbus:
+            is_rtu = "RTU" in w_proto.upper()
+            target_top = f"Modbus-{'RTU' if is_rtu else 'TCP'}://{w_ip}:{w_port}"
+            action_desc = f"MODBUS {'RTU' if is_rtu else 'TCP'} ({cmd_val.upper()})"
+            if batch:
+                b_keys = sorted([int(k) for k in batch_dict.keys() if str(k).isdigit()])
+                min_k = b_keys[0] if b_keys else 3355
+                max_k = b_keys[-1] if b_keys else 3355
+                qty = max_k - min_k + 1
+                wire_k = calc_wire_addr(min_k, w_zero_based)
+                proto_disp = f"[MBAP Unit:{w_unit_id}] [PDU Func:03 | Wire:{wire_k}..{wire_k+qty-1} | Qty:{qty} ({len(b_keys)} regs)]"
+                out_desc = f"Batch read {len(batch_dict)} regs (Wire {wire_k}..{wire_k+qty-1})"
+            else:
+                try:
+                    wire_k = calc_wire_addr(int(r_num), w_zero_based)
+                except ValueError:
+                    wire_k = 0
+                if cmd_val == "write":
+                    proto_disp = f"[MBAP Unit:{w_unit_id}] [PDU Func:06 (Write Reg) | Wire:{wire_k} (Reg {r_num}) | Value:{r_val}]"
+                    out_desc = f"Write Reg [{r_num}] = {r_val} (Wire {wire_k}, Func 06)"
+                else:
+                    proto_disp = f"[MBAP Unit:{w_unit_id}] [PDU Func:03 (Read Reg) | Wire:{wire_k} (Reg {r_num}) | Qty:1]"
+                    out_desc = f"Read Reg [{r_num}] (Wire {wire_k}, Func 03)"
+            disp_payload = proto_disp
+        else:
+            payload_json = json.dumps(payload_obj)
+            target_top = f"WiFi://{w_ip}:{w_port}/ondemand"
+            action_desc = f"LOCAL WIFI QUERY ({cmd_val.upper()})"
+            disp_payload = payload_json
+            out_desc = desc
+
         lbl_fetch_status.config(
-            text=f"[📶 WiFi Query] Contacting local device at {w_ip}:{w_port}... Waiting for response...",
+            text=f"[📶 Modbus Query] Dispatching to {w_ip}:{w_port} (Unit {w_unit_id}, {cmd_val.upper()})... Waiting for ACK/response...",
             fg="#e65100"
         )
-        log_transmission("SENT", target_top, payload_json, extra=desc)
-        log_topic_started_box(target_top, action="LOCAL WIFI QUERY", payload=payload_json, extra=desc)
+        log_transmission("SENT", target_top, disp_payload, extra=out_desc)
+        log_topic_started_box(target_top, action=action_desc, payload=disp_payload, extra=out_desc)
+
+        if lbl_wifi_pub_info:
+            lbl_wifi_pub_info.config(text=f"Endpoint: {target_top} (Unit ID: {w_unit_id}) [{now_str}]")
+        if lbl_wifi_pub_payload:
+            lbl_wifi_pub_payload.config(text=f"Modbus Frame: {disp_payload}")
 
         def wifi_worker():
-            success, resp_data, raw_resp, rtt_ms, err = query_local_wifi_device(w_ip, w_port, w_proto, payload_obj)
+            success, resp_data, raw_resp, rtt_ms, err, trace_log = query_local_wifi_device(
+                w_ip, w_port, w_proto, payload_obj, unit_id=w_unit_id, zero_based=w_zero_based, timeout=5.0
+            )
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
             def on_finish():
+                if txt_wifi_console:
+                    log_wifi_console(trace_log + "\n")
                 if success:
-                    log_transmission("RECV", target_top, raw_resp or json.dumps(resp_data), latency=rtt_ms, extra=f"HTTP OK | RTT: {rtt_ms} ms")
-                    log_topic_completed_box(target_top, rtt_ms=rtt_ms, payload=raw_resp, extra=f"Device {w_ip} replied successfully")
-                    if 'txt_wifi_console' in locals():
-                        log_wifi_console(f"[{now_str}] [✓ SUCCESS] {w_proto} -> {w_ip}:{w_port} (RTT: {rtt_ms} ms)\nResponse: {raw_resp}\n")
-                    # Update REGISTER_CACHE with received registers
+                    resp_disp = f"RX Hex: [ {raw_resp} ]" if (is_modbus and raw_resp) else (json.dumps(resp_data) if resp_data else str(raw_resp))
+                    log_transmission("RECV", target_top, resp_disp, latency=rtt_ms, extra=f"Modbus ACK OK | RTT: {rtt_ms} ms")
+                    log_topic_completed_box(target_top, rtt_ms=rtt_ms, payload=resp_disp, extra=f"Device {w_ip} acknowledged successfully")
+                    
+                    is_write_cmd = (cmd_val.lower() == "write")
+                    ack_label = "ACK CONFIRMED" if is_write_cmd else "READ SUCCESS"
+                    if lbl_wifi_recv_info:
+                        lbl_wifi_recv_info.config(text=f"Status: [✓ {ack_label}] (RTT: {rtt_ms} ms) | {w_proto}", fg="#2e7d32")
+                    if lbl_wifi_recv_payload:
+                        if is_write_cmd:
+                            lbl_wifi_recv_payload.config(text=f"[✓ ACK ECHO CONFIRMED] Written Register [{r_num}] = {r_val} | RX Hex: [ {raw_resp} ]")
+                        else:
+                            lbl_wifi_recv_payload.config(text=f"Data / RX: {resp_data or raw_resp}")
+
+                    # Update REGISTER_CACHE with confirmed values
                     if resp_data:
                         updated_cnt = update_registers_table(resp_data, now_utc)
                     else:
-                        sim_data = {str(k): 1 for k in (batch_dict if batch else [r_num])}
+                        sim_data = {str(k): (int(entry_reg_val_dyn.get().strip() or 1) if is_write_cmd else 1) for k in (batch_dict if batch else [r_num])}
                         updated_cnt = update_registers_table(sim_data, now_utc)
+
+                    # Refresh both register tables (Tab 1 & Tab 2)
+                    apply_filter_regs()
+
                     lbl_fetch_status.config(
-                        text=f"[✓ WiFi Success] Received response from {w_ip}:{w_port} (RTT: {rtt_ms} ms)! Updated {updated_cnt} registers.",
+                        text=f"[✓ WiFi {ack_label}] Confirmed response from {w_ip}:{w_port} (RTT: {rtt_ms} ms)! Updated {updated_cnt} registers.",
                         fg="#1b5e20"
                     )
                 else:
-                    err_msg = f"Device at {w_ip}:{w_port} offline: {err or 'Timeout'}"
+                    err_msg = f"Device at {w_ip}:{w_port} did not respond: {err or 'Timed out after 3 attempts'}"
                     log_transmission("ERR", target_top, err_msg, latency=rtt_ms)
-                    if 'txt_wifi_console' in locals():
-                        log_wifi_console(f"[{now_str}] [✗ ERROR] {w_proto} -> {w_ip}:{w_port} | {err_msg}\n")
+                    if lbl_wifi_recv_info:
+                        lbl_wifi_recv_info.config(text=f"Status: Error | {err_msg}", fg="#c62828")
+                    if lbl_wifi_recv_payload:
+                        lbl_wifi_recv_payload.config(text=f"Details: {err or 'Timeout'}")
                     lbl_fetch_status.config(text=f"[✗ WiFi Device Offline] {err_msg}", fg="#c62828")
-                    sim_ans = messagebox.askyesno(
-                        "WiFi Device Unreachable",
-                        f"Could not reach WiFi device at {w_ip}:{w_port} ({err}).\n\nSimulate successful response for testing register values?"
-                    )
-                    if sim_ans:
-                        sim_data = {str(k): 1 for k in (batch_dict if batch else [r_num])}
-                        updated_cnt = update_registers_table(sim_data, now_utc)
-                        lbl_fetch_status.config(
-                            text=f"[✓ Simulated WiFi] Updated {updated_cnt} registers locally for {w_ip}!",
-                            fg="#1b5e20"
-                        )
+
                 sync_and_save_state()
 
-            root.after(0, on_finish)
+            safe_gui_call(on_finish)
 
         threading.Thread(target=wifi_worker, daemon=True).start()
 
@@ -2270,7 +2625,7 @@ def launch_gui(initial_config=None):
         displayed.sort(key=lambda x: x["address"])
 
         trees_to_update = [tree_regs]
-        if 'tree_wifi_regs' in locals() and tree_wifi_regs is not None:
+        if tree_wifi_regs is not None:
             trees_to_update.append(tree_wifi_regs)
 
         for tr in trees_to_update:
@@ -2302,7 +2657,7 @@ def launch_gui(initial_config=None):
 
         count_text = f"Showing {len(displayed)} registers (Total {len(overall_matches)} matching '{query}')" if query else f"Showing {len(displayed)} / {len(REGISTER_CACHE)} registers in '{sec}'"
         lbl_reg_count.config(text=count_text)
-        if 'lbl_wifi_reg_count' in locals():
+        if lbl_wifi_reg_count is not None:
             lbl_wifi_reg_count.config(text=count_text)
 
         update_selection_state()
@@ -2322,7 +2677,7 @@ def launch_gui(initial_config=None):
             lbl_pub_topic_info.config(text=f"Topic: {topic}  [{now_ts}]")
             disp_p = payload if len(payload) <= 90 else (payload[:87] + "...")
             lbl_pub_payload_info.config(text=f"Payload: {disp_p}")
-            if "WiFi" in topic and 'lbl_wifi_pub_info' in locals():
+            if "WiFi" in topic and lbl_wifi_pub_info is not None:
                 lbl_wifi_pub_info.config(text=f"Endpoint: {topic} [{now_ts}]")
                 lbl_wifi_pub_payload.config(text=f"Payload: {disp_p}")
         else:
@@ -2333,7 +2688,7 @@ def launch_gui(initial_config=None):
             lbl_recv_topic_info.config(text=f"Topic: {topic}  [{now_ts}{lat_txt}]")
             disp_p = payload if len(payload) <= 90 else (payload[:87] + "...")
             lbl_recv_payload_info.config(text=f"Payload: {disp_p}")
-            if "WiFi" in topic and 'lbl_wifi_recv_info' in locals():
+            if "WiFi" in topic and lbl_wifi_recv_info is not None:
                 lbl_wifi_recv_info.config(text=f"Status: Received [{now_ts}{lat_txt}]")
                 lbl_wifi_recv_payload.config(text=f"Data: {disp_p}")
 
@@ -2468,18 +2823,21 @@ def launch_gui(initial_config=None):
                 info.get("status", "Active")
             ))
 
-    def add_custom_subscription():
+    def add_custom_subscription(topic_to_sub=None):
         nonlocal active_client
-        target_top = entry_sub_topic_tab1.get().strip()
+        target_top = (topic_to_sub or entry_sub_topic_tab1.get()).strip()
         if not target_top:
             messagebox.showwarning("Topic", "Please enter a valid MQTT topic to subscribe.")
             return
         qos_val = int(combo_sub_qos.get() or 0)
         subscribed_topics_map[target_top] = {"qos": qos_val, "packets": 0, "status": "Subscribed"}
         if active_client and is_connected:
-            active_client.subscribe(target_top, qos=qos_val)
+            try:
+                active_client.subscribe(target_top, qos=qos_val)
+            except Exception:
+                pass
         refresh_sub_treeview()
-        lbl_sub_status.config(text=f"[✓] Subscribed to '{target_top}' (QoS {qos_val})", fg="green")
+        lbl_sub_status.config(text=f"[✓] Subscribed to '{target_top}' (QoS {qos_val})", fg="#1b5e20")
         sync_and_save_state()
 
     def remove_subscription():
@@ -2500,6 +2858,20 @@ def launch_gui(initial_config=None):
         nonlocal active_client
         if not target_imei:
             return
+        # Synchronize Target IMEI and Sub IMEI entry widgets
+        if 'entry_imei_dyn' in locals() and entry_imei_dyn.get().strip() != target_imei:
+            entry_imei_dyn.delete(0, tk.END)
+            entry_imei_dyn.insert(0, target_imei)
+        if 'entry_sub_imei_dyn' in locals() and entry_sub_imei_dyn.get().strip() != target_imei:
+            entry_sub_imei_dyn.delete(0, tk.END)
+            entry_sub_imei_dyn.insert(0, target_imei)
+        if 'entry_pub_topic_tab1' in locals():
+            entry_pub_topic_tab1.delete(0, tk.END)
+            entry_pub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{target_imei}/ondemand/sub")
+        if 'entry_sub_topic_tab1' in locals():
+            entry_sub_topic_tab1.delete(0, tk.END)
+            entry_sub_topic_tab1.insert(0, f"rtsg-1/ongridrooftop/{target_imei}/#")
+
         # Unsubscribe previous topics from broker if connected
         if active_client and is_connected:
             for old_t in list(subscribed_topics_map.keys()):
@@ -2627,56 +2999,105 @@ def launch_gui(initial_config=None):
     entry_wifi_ip.insert(0, saved_state.get("wifi_device_ip", "192.168.4.1"))
     entry_wifi_ip.pack(side=tk.LEFT, padx=(0, 4))
 
-    def set_wifi_preset(ip_val, port_val=80):
+    def set_wifi_preset(ip_val, port_val=502):
         entry_wifi_ip.delete(0, tk.END)
         entry_wifi_ip.insert(0, ip_val)
         entry_wifi_port.delete(0, tk.END)
         entry_wifi_port.insert(0, str(port_val))
 
-    btn_pre1 = ttk.Button(f_wifi_ip_row, text="192.168.4.1 (AP)", command=lambda: set_wifi_preset("192.168.4.1", 80))
+    btn_pre1 = ttk.Button(f_wifi_ip_row, text="192.168.4.1 (AP)", command=lambda: set_wifi_preset("192.168.4.1", 502))
     btn_pre1.pack(side=tk.LEFT, padx=1)
-    btn_pre2 = ttk.Button(f_wifi_ip_row, text="192.168.1.100", command=lambda: set_wifi_preset("192.168.1.100", 80))
+    btn_pre2 = ttk.Button(f_wifi_ip_row, text="192.168.1.100", command=lambda: set_wifi_preset("192.168.1.100", 502))
     btn_pre2.pack(side=tk.LEFT, padx=1)
+    btn_pre3 = ttk.Button(f_wifi_ip_row, text="127.0.0.1 (Local)", command=lambda: set_wifi_preset("127.0.0.1", 502))
+    btn_pre3.pack(side=tk.LEFT, padx=1)
 
     ttk.Label(f_wifi_left, text="Port:").pack(anchor=tk.W, pady=(2, 1))
     f_wifi_port_row = ttk.Frame(f_wifi_left)
     f_wifi_port_row.pack(fill=tk.X, pady=(0, 4))
     entry_wifi_port = ttk.Entry(f_wifi_port_row, font=("Consolas", 9), width=8)
-    entry_wifi_port.insert(0, str(saved_state.get("wifi_device_port", 80)))
+    entry_wifi_port.insert(0, str(saved_state.get("wifi_device_port", 502)))
     entry_wifi_port.pack(side=tk.LEFT, padx=(0, 4))
 
-    ttk.Button(f_wifi_port_row, text="Port 80", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "80"))).pack(side=tk.LEFT, padx=1)
-    ttk.Button(f_wifi_port_row, text="Port 8080", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "8080"))).pack(side=tk.LEFT, padx=1)
-    ttk.Button(f_wifi_port_row, text="Port 502", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "502"))).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_port_row, text="502 (Modbus TCP)", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "502"))).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_port_row, text="Port 5020", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "5020"))).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_port_row, text="Port 8899", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "8899"))).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_port_row, text="Port 10502", command=lambda: (entry_wifi_port.delete(0, tk.END), entry_wifi_port.insert(0, "10502"))).pack(side=tk.LEFT, padx=1)
 
-    ttk.Label(f_wifi_left, text="Transport Protocol:").pack(anchor=tk.W, pady=(2, 1))
+    # Unit / Slave ID & Addressing Offset
+    f_wifi_unit_row = ttk.Frame(f_wifi_left)
+    f_wifi_unit_row.pack(fill=tk.X, pady=(0, 4))
+    ttk.Label(f_wifi_unit_row, text="Unit / Slave ID:").pack(side=tk.LEFT, padx=(0, 2))
+    entry_wifi_unit_id = ttk.Entry(f_wifi_unit_row, font=("Consolas", 9, "bold"), width=5)
+    entry_wifi_unit_id.insert(0, str(saved_state.get("wifi_slave_id", 1)))
+    entry_wifi_unit_id.pack(side=tk.LEFT, padx=2)
+
+    var_wifi_zero_based = tk.BooleanVar(value=saved_state.get("wifi_zero_based", True))
+    chk_wifi_zero_based = ttk.Checkbutton(f_wifi_unit_row, text="0-based offset (Addr = Reg - 1)", variable=var_wifi_zero_based)
+    chk_wifi_zero_based.pack(side=tk.LEFT, padx=4)
+
+    ttk.Label(f_wifi_left, text="Transport Protocol (Modbus Poll / TCP):").pack(anchor=tk.W, pady=(2, 1))
     combo_wifi_proto = ttk.Combobox(
         f_wifi_left,
-        values=["HTTP POST (/ondemand)", "HTTP GET (/ondemand)", "TCP Direct Socket (JSON)"],
+        values=[
+            "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)",
+            "Modbus TCP/IP (Port 502 - Func 04 Input Regs)",
+            "Modbus RTU over TCP (Port 502 / 8899)",
+            "HTTP POST (/ondemand)",
+            "HTTP GET (/ondemand)",
+            "TCP Direct Socket (JSON)"
+        ],
         state="readonly",
         font=("Segoe UI", 9)
     )
-    combo_wifi_proto.set(saved_state.get("wifi_protocol", "HTTP POST (/ondemand)"))
-    combo_wifi_proto.pack(fill=tk.X, pady=(0, 6))
+    combo_wifi_proto.set(saved_state.get("wifi_protocol", "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)"))
+    combo_wifi_proto.pack(fill=tk.X, pady=(0, 4))
+
+    def do_probe_protocol():
+        ip = entry_wifi_ip.get().strip()
+        cur_p = entry_wifi_port.get().strip() or "502"
+        lbl_wifi_ping_res.config(text=f"Probing {ip} across Modbus TCP, RTU (Ports 502, 5020, 8899)...", fg="orange", bg="#fff3e0")
+        log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Auto-Detect Probe on {ip}...\n")
+        def probe_worker():
+            found, proto, port, uid, rtt, msg = probe_wifi_device_protocols(ip, default_port=cur_p)
+            def on_done():
+                if found:
+                    combo_wifi_proto.set(proto)
+                    entry_wifi_port.delete(0, tk.END)
+                    entry_wifi_port.insert(0, str(port))
+                    entry_wifi_unit_id.delete(0, tk.END)
+                    entry_wifi_unit_id.insert(0, str(uid))
+                    lbl_wifi_ping_res.config(text=f"[✓] {proto} on Port {port} (Unit ID {uid}, RTT {rtt} ms)", fg="#1b5e20", bg="#e8f5e9")
+                    log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✓ PROBE SUCCESS] {msg}\n")
+                    messagebox.showinfo("Protocol Auto-Detected", f"Remote device responded!\n\nProtocol: {proto}\nPort: {port}\nUnit/Slave ID: {uid}\nRound-Trip Time: {rtt} ms")
+                else:
+                    lbl_wifi_ping_res.config(text=f"[✗] {msg}", fg="#b71c1c", bg="#ffebee")
+                    log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✗ PROBE FAILED] {msg}\n")
+                    messagebox.showwarning("Auto-Detect Probe", f"Could not detect active Modbus service on {ip}.\n\nEnsure the WiFi device is powered on, connected to the same network, and listening on Port 502 (Modbus TCP).\n\nDetails: {msg}")
+                sync_and_save_state()
+            root.after(0, on_done)
+        threading.Thread(target=probe_worker, daemon=True).start()
+
+    btn_probe_wifi = tk.Button(
+        f_wifi_left,
+        text="🔍 AUTO-DETECT PROTOCOL & PROBE DEVICE",
+        command=do_probe_protocol,
+        font=("Segoe UI", 9, "bold"),
+        bg="#6a1b9a",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=8,
+        pady=3
+    )
+    btn_probe_wifi.pack(fill=tk.X, pady=(2, 4))
 
     f_ping_btn_row = ttk.Frame(f_wifi_left)
-    f_ping_btn_row.pack(fill=tk.X, pady=4)
-
-    lbl_wifi_ping_res = tk.Label(
-        f_wifi_left,
-        text="Status: Ready to connect",
-        fg="#1565c0",
-        bg="#e3f2fd",
-        relief=tk.SOLID,
-        bd=1,
-        padx=6,
-        pady=4,
-        font=("Segoe UI", 9)
-    )
+    f_ping_btn_row.pack(fill=tk.X, pady=2)
 
     def do_ping_test():
         ip = entry_wifi_ip.get().strip()
-        port = entry_wifi_port.get().strip() or "80"
+        port = entry_wifi_port.get().strip() or "502"
         lbl_wifi_ping_res.config(text=f"Pinging {ip}:{port}...", fg="orange", bg="#fff3e0")
         def ping_worker():
             ok, ms, msg = ping_local_wifi_device(ip, port)
@@ -2692,24 +3113,207 @@ def launch_gui(initial_config=None):
 
     btn_ping_wifi = tk.Button(
         f_ping_btn_row,
-        text="📶 Ping / Test Local WiFi Connection",
+        text="📶 Ping Once",
         command=do_ping_test,
-        font=("Segoe UI", 9, "bold"),
+        font=("Segoe UI", 8, "bold"),
         bg="#0288d1",
         fg="white",
-        padx=8,
-        pady=3
+        padx=6,
+        pady=2
     )
-    btn_ping_wifi.pack(fill=tk.X)
-    lbl_wifi_ping_res.pack(fill=tk.X, pady=(4, 6))
+    btn_ping_wifi.pack(side=tk.LEFT, padx=1)
 
-    ttk.Label(f_wifi_left, text="WiFi Raw Communication Stream:", font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, pady=(4, 1))
+    def do_cancel_wifi():
+        var_auto_ping.set(False)
+        lbl_wifi_ping_res.config(text="⏹ Operation / Auto-ping stopped", fg="#e65100", bg="#fff3e0")
+        if txt_wifi_console:
+            log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] ⏹ Operation / Continuous Auto-ping stopped by user\n")
+
+    btn_cancel_wifi = tk.Button(
+        f_ping_btn_row,
+        text="⏹ Cancel",
+        command=do_cancel_wifi,
+        font=("Segoe UI", 8, "bold"),
+        bg="#d32f2f",
+        fg="white",
+        padx=6,
+        pady=2
+    )
+    btn_cancel_wifi.pack(side=tk.LEFT, padx=2)
+
+    var_auto_ping = tk.BooleanVar(value=False)
+
+    def auto_ping_loop():
+        while var_auto_ping.get():
+            ip   = entry_wifi_ip.get().strip()
+            port = entry_wifi_port.get().strip() or "502"
+            ok, ms, msg = ping_local_wifi_device(ip, port, timeout=1.5)
+            now_str = datetime.now().strftime("%H:%M:%S")
+            def update_badge(is_ok=ok, rtt=ms, emsg=msg, ts=now_str, _ip=ip, _port=port):
+                if not var_auto_ping.get():
+                    return
+                if is_ok:
+                    lbl_wifi_ping_res.config(
+                        text=f"🟢 ONLINE ({rtt} ms) | {_ip}:{_port} | {ts}",
+                        fg="#1b5e20", bg="#e8f5e9"
+                    )
+                    if txt_wifi_console:
+                        log_wifi_console(
+                            f"[{ts}] 🟢 Ping OK -> {_ip}:{_port} | RTT: {rtt} ms\n"
+                        )
+                else:
+                    lbl_wifi_ping_res.config(
+                        text=f"🔴 OFFLINE ({emsg}) | {_ip}:{_port} | {ts}",
+                        fg="#b71c1c", bg="#ffebee"
+                    )
+                    if txt_wifi_console:
+                        log_wifi_console(
+                            f"[{ts}] 🔴 Ping FAILED -> {_ip}:{_port} | {emsg}\n"
+                        )
+            safe_gui_call(update_badge)
+            time.sleep(2.0)
+
+    def toggle_auto_ping():
+        if var_auto_ping.get():
+            threading.Thread(target=auto_ping_loop, daemon=True).start()
+
+    chk_auto_ping = ttk.Checkbutton(f_ping_btn_row, text="Continuous Auto-Ping (every 2s)", variable=var_auto_ping, command=toggle_auto_ping)
+    chk_auto_ping.pack(side=tk.LEFT, padx=4)
+
+    lbl_wifi_ping_res = tk.Label(
+        f_wifi_left,
+        text="Status: Ready to connect",
+        fg="#1565c0",
+        bg="#e3f2fd",
+        relief=tk.SOLID,
+        bd=1,
+        padx=6,
+        pady=3,
+        font=("Segoe UI", 8)
+    )
+    lbl_wifi_ping_res.pack(fill=tk.X, pady=(2, 3))
+
+    # ── Modbus Reader Library Tools ───────────────────────────────────────────
+    f_mb_tools = ttk.LabelFrame(f_wifi_left, text="Modbus Reader Tools & Snapshots", padding=4)
+    f_mb_tools.pack(fill=tk.X, pady=(1, 3))
+
+    f_mb_row1 = ttk.Frame(f_mb_tools)
+    f_mb_row1.pack(fill=tk.X, pady=1)
+
+    def do_load_registers_1():
+        r1_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registers_1.json")
+        if not os.path.exists(r1_path):
+            messagebox.showerror("Error", f"registers_1.json not found at:\n{r1_path}")
+            return
+        try:
+            with open(r1_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            vals = d.get("values", {})
+            now_ts = d.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            updated = update_registers_table(vals, now_ts)
+            apply_filter_regs()
+            msg = f"Imported registers_1.json ({len(vals)} registers, {updated} updated into table)!"
+            log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✓ LOAD SNAPSHOT] {msg}\n")
+            lbl_wifi_fetch_status.config(text=f"[✓] {msg}", fg="#1b5e20")
+            messagebox.showinfo("Snapshot Loaded", f"Successfully loaded registers_1.json!\n\nRegisters in file: {len(vals)}\nRegisters updated into table: {updated}\nTimestamp: {now_ts}")
+        except Exception as ex:
+            messagebox.showerror("Error", f"Failed to load registers_1.json:\n{ex}")
+
+    def do_compare_snapshots():
+        r1_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registers_1.json")
+        r2_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registers_2.json")
+        if not os.path.exists(r1_path):
+            messagebox.showerror("Compare", f"Baseline registers_1.json not found at:\n{r1_path}")
+            return
+        try:
+            with open(r1_path, "r", encoding="utf-8") as f:
+                d1 = json.load(f)
+            if os.path.exists(r2_path):
+                with open(r2_path, "r", encoding="utf-8") as f:
+                    d2 = json.load(f)
+                comp_source = "registers_2.json"
+            else:
+                cache_vals = {str(k): v.get("value", 0) for k, v in REGISTER_CACHE.items() if v.get("value", "---") != "---"}
+                d2 = {"start_register": d1.get("start_register", 2000), "values": cache_vals}
+                comp_source = "Current Live Cache"
+            
+            diffs = _comp_reg.compare(d1, d2) if _comp_reg else []
+            log_wifi_console(f"\n[{datetime.now().strftime('%H:%M:%S')}] ═══ MODBUS REGISTER COMPARISON ═══\n")
+            log_wifi_console(f"Comparing registers_1.json vs {comp_source}...\n")
+            if not diffs:
+                log_wifi_console("No differences found. All register values match!\n")
+                messagebox.showinfo("Compare Registers", f"No differences found!\n\nAll register values match between registers_1.json and {comp_source}.")
+            else:
+                log_wifi_console(f"Found {len(diffs)} differing register(s):\n")
+                log_wifi_console(f"{'Register':<10} {'registers_1':<15} {comp_source:<15}\n")
+                log_wifi_console("-" * 45 + "\n")
+                for item in diffs[:80]:
+                    addr, v1, v2 = item[0], item[1], item[2]
+                    log_wifi_console(f"{str(addr):<10} {str(v1):<15} {str(v2):<15}  <-- DIFF\n")
+                if len(diffs) > 80:
+                    log_wifi_console(f"... and {len(diffs)-80} more differences.\n")
+                messagebox.showinfo("Compare Registers", f"Found {len(diffs)} differing register(s)!\n\nDetailed comparison table printed to the WiFi analyzer console below.")
+        except Exception as ex:
+            messagebox.showerror("Compare Error", f"Comparison failed:\n{ex}")
+
+    def do_launch_pcb_dashboard():
+        app_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Modbus reader", "modbus_app.py")
+        if os.path.exists(app_path):
+            subprocess.Popen([sys.executable, app_path], cwd=os.path.dirname(app_path))
+            log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✓] Launched PCB Modbus Dashboard (modbus_app.py)\n")
+        else:
+            messagebox.showerror("Error", f"File not found:\n{app_path}")
+
+    def do_launch_port_scanner():
+        ps_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Modbus reader", "port_scanner.py")
+        if os.path.exists(ps_path):
+            subprocess.Popen([sys.executable, ps_path], cwd=os.path.dirname(ps_path))
+            log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✓] Launched PCB Port Scanner (port_scanner.py)\n")
+        else:
+            messagebox.showerror("Error", f"File not found:\n{ps_path}")
+
+    btn_load_r1 = ttk.Button(f_mb_row1, text="📂 Load registers_1.json", command=do_load_registers_1)
+    btn_load_r1.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+    btn_comp = ttk.Button(f_mb_row1, text="⚖ Compare Snapshots", command=do_compare_snapshots)
+    btn_comp.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+
+    f_mb_row2 = ttk.Frame(f_mb_tools)
+    f_mb_row2.pack(fill=tk.X, pady=1)
+
+    btn_pcb = ttk.Button(f_mb_row2, text="📊 PCB Dashboard", command=do_launch_pcb_dashboard)
+    btn_pcb.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+    btn_pscan = ttk.Button(f_mb_row2, text="🔍 Port Scanner", command=do_launch_port_scanner)
+    btn_pscan.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+
+    ttk.Label(f_wifi_left, text="WiFi Raw Communication Stream (Modbus Analyzer):", font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, pady=(4, 1))
     txt_wifi_console = scrolledtext.ScrolledText(f_wifi_left, height=14, bg="#1e1e1e", fg="#00e676", font=("Consolas", 8))
     txt_wifi_console.pack(fill=tk.BOTH, expand=True, pady=(1, 2))
 
     def log_wifi_console(text_msg):
         txt_wifi_console.insert(tk.END, text_msg)
         txt_wifi_console.see(tk.END)
+
+    f_wifi_log_tools = ttk.Frame(f_wifi_left)
+    f_wifi_log_tools.pack(fill=tk.X, pady=(2, 0))
+
+    def clear_wifi_console():
+        txt_wifi_console.delete("1.0", tk.END)
+
+    def export_wifi_log():
+        content = txt_wifi_console.get("1.0", tk.END)
+        fn = f"wifi_modbus_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(content)
+        messagebox.showinfo("Export Log", f"Modbus WiFi packet log saved to:\n{fn}")
+
+    def copy_wifi_log():
+        root.clipboard_clear()
+        root.clipboard_append(txt_wifi_console.get("1.0", tk.END))
+        messagebox.showinfo("Copied", "Log contents copied to clipboard!")
+
+    ttk.Button(f_wifi_log_tools, text="Clear Stream", command=clear_wifi_console).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_log_tools, text="💾 Export Log", command=export_wifi_log).pack(side=tk.LEFT, padx=1)
+    ttk.Button(f_wifi_log_tools, text="📋 Copy All", command=copy_wifi_log).pack(side=tk.LEFT, padx=1)
 
     # =========================================================================
     # RIGHT CONTAINER: FULL SYNCHRONIZED REGISTER EXPLORER & DISPATCHER
@@ -2841,33 +3445,177 @@ def launch_gui(initial_config=None):
     wf_action_row = ttk.Frame(f_wifi_right)
     wf_action_row.pack(fill=tk.X, pady=(3, 2))
 
+    def do_poll_range():
+        ip   = entry_wifi_ip.get().strip() or "192.168.4.1"
+        port = int(entry_wifi_port.get().strip() or 502)
+        uid  = int(entry_wifi_unit_id.get().strip() or 1)
+        proto = combo_wifi_proto.get().strip()
+        is_rtu = "RTU" in proto.upper()
+
+        top_dlg = tk.Toplevel(root)
+        top_dlg.title("Modbus Range Poller (modbus_poll_3)")
+        top_dlg.geometry("360x220")
+        top_dlg.transient(root)
+        top_dlg.grab_set()
+
+        ttk.Label(top_dlg, text="Modbus Range Poller (modbus_poll_3)", font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
+        f_in = ttk.Frame(top_dlg, padding=10)
+        f_in.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(f_in, text="Start Register:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ent_start = ttk.Entry(f_in, width=12)
+        ent_start.insert(0, "2000")
+        ent_start.grid(row=0, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(f_in, text="End Register:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ent_end = ttk.Entry(f_in, width=12)
+        ent_end.insert(0, "6000")
+        ent_end.grid(row=1, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(f_in, text="Chunk Size:").grid(row=2, column=0, sticky=tk.W, pady=3)
+        ent_chunk = ttk.Entry(f_in, width=12)
+        ent_chunk.insert(0, "100")
+        ent_chunk.grid(row=2, column=1, sticky=tk.W, pady=3)
+
+        def start_range_worker():
+            try:
+                s_reg = int(ent_start.get().strip())
+                e_reg = int(ent_end.get().strip())
+                c_sz  = int(ent_chunk.get().strip())
+            except ValueError:
+                messagebox.showerror("Error", "Please enter valid integers for start, end, and chunk size.")
+                return
+            top_dlg.destroy()
+
+            lbl_wifi_fetch_status.config(
+                text=f"[📶 Range Poll] Polling registers {s_reg}..{e_reg} from {ip}:{port}...",
+                fg="#e65100"
+            )
+            log_wifi_console(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting Modbus Range Poll {s_reg}..{e_reg} (Chunk: {c_sz}) on {ip}:{port} (Unit: {uid})...\n")
+
+            def worker():
+                try:
+                    client = _SocketModbusClient(host=ip, port=port, timeout=5.0, is_rtu=is_rtu)
+                    if not client.connect():
+                        safe_gui_call(lambda: (
+                            lbl_wifi_fetch_status.config(text=f"[✗] Could not connect to {ip}:{port}", fg="#c62828"),
+                            log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✗ FAILED] Could not connect to {ip}:{port}\n")
+                        ))
+                        return
+
+                    t0_p = time.time()
+                    raw_vals = _modbus_read_registers(
+                        client, start=s_reg, end=e_reg,
+                        reg_type="holding", slave_id=uid,
+                        chunk_size=c_sz
+                    )
+                    client.close()
+                    elapsed = round(time.time() - t0_p, 2)
+
+                    values_dict = {}
+                    for i, v in enumerate(raw_vals):
+                        rn = s_reg + i
+                        if v is not None:
+                            values_dict[str(rn)] = v
+
+                    r2_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registers_2.json")
+                    snap_data = {
+                        "ip": ip,
+                        "port": port,
+                        "slave_id": uid,
+                        "start_register": s_reg,
+                        "end_register": e_reg,
+                        "timestamp": datetime.now().isoformat(),
+                        "values": values_dict
+                    }
+                    with open(r2_path, "w", encoding="utf-8") as f_out:
+                        json.dump(snap_data, f_out, indent=2)
+
+                    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    updated_cnt = update_registers_table(values_dict, now_utc)
+
+                    def on_done():
+                        apply_filter_regs()
+                        lbl_wifi_fetch_status.config(
+                            text=f"[✓ Poll Complete] Polled {len(values_dict)} registers in {elapsed}s! Saved to registers_2.json",
+                            fg="#1b5e20"
+                        )
+                        log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✓ POLL SUCCESS] Polled {len(values_dict)} registers in {elapsed}s. Saved to {r2_path}\n")
+                        messagebox.showinfo("Poll Complete", f"Modbus Range Poll Completed!\n\nRegisters polled: {len(values_dict)}\nUpdated into table: {updated_cnt}\nTime taken: {elapsed} seconds\nSaved to: registers_2.json")
+
+                    safe_gui_call(on_done)
+                except Exception as ex:
+                    safe_gui_call(lambda: (
+                        lbl_wifi_fetch_status.config(text=f"[✗ Error] Poll failed: {ex}", fg="#c62828"),
+                        log_wifi_console(f"[{datetime.now().strftime('%H:%M:%S')}] [✗ POLL ERROR] {ex}\n")
+                    ))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_start = tk.Button(top_dlg, text="Start Polling", command=start_range_worker, bg="#28a745", fg="white", font=("Segoe UI", 9, "bold"), padx=10, pady=3)
+        btn_start.pack(pady=(0, 10))
+
+    def do_write_and_ack():
+        combo_wifi_cmd_dyn.set("write")
+        combo_cmd_dyn.set("write")
+        update_payload_preview()
+        dispatch_wifi_fetch(batch=False)
+
     btn_wifi_fetch_single = tk.Button(
         wf_action_row,
-        text="🚀 FETCH LOCAL DEVICE VIA WIFI (SINGLE)",
+        text="🚀 FETCH SINGLE REG",
         command=lambda: dispatch_wifi_fetch(batch=False),
-        font=("Segoe UI", 9, "bold"),
+        font=("Segoe UI", 8, "bold"),
         bg="#28a745",
         fg="white",
         relief=tk.RAISED,
         bd=2,
-        padx=10,
-        pady=4
+        padx=6,
+        pady=3
     )
-    btn_wifi_fetch_single.pack(side=tk.LEFT, padx=3)
+    btn_wifi_fetch_single.pack(side=tk.LEFT, padx=2)
 
     btn_wifi_fetch_batch = tk.Button(
         wf_action_row,
-        text="📦 BATCH FETCH VIA WIFI (ALL SELECTED)",
+        text="📦 BATCH FETCH",
         command=lambda: dispatch_wifi_fetch(batch=True),
-        font=("Segoe UI", 9, "bold"),
+        font=("Segoe UI", 8, "bold"),
         bg="#0d47a1",
         fg="white",
         relief=tk.RAISED,
         bd=2,
-        padx=10,
-        pady=4
+        padx=6,
+        pady=3
     )
-    btn_wifi_fetch_batch.pack(side=tk.LEFT, padx=3)
+    btn_wifi_fetch_batch.pack(side=tk.LEFT, padx=2)
+
+    btn_wifi_poll_range = tk.Button(
+        wf_action_row,
+        text="📥 POLL RANGE (2000-6000)",
+        command=do_poll_range,
+        font=("Segoe UI", 8, "bold"),
+        bg="#f57c00",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=6,
+        pady=3
+    )
+    btn_wifi_poll_range.pack(side=tk.LEFT, padx=2)
+
+    btn_wifi_write_ack = tk.Button(
+        wf_action_row,
+        text="✍ WRITE & VERIFY ACK",
+        command=do_write_and_ack,
+        font=("Segoe UI", 8, "bold"),
+        bg="#c2185b",
+        fg="white",
+        relief=tk.RAISED,
+        bd=2,
+        padx=6,
+        pady=3
+    )
+    btn_wifi_write_ack.pack(side=tk.LEFT, padx=2)
 
     lbl_wifi_fetch_status = tk.Label(
         f_wifi_right,
@@ -3187,10 +3935,10 @@ def launch_gui(initial_config=None):
             "subscribe_topic": entry_sub_topic_tab1.get().strip(),
             "subscribed_topics": [t for t in subscribed_topics_map.keys() if (not entry_imei_dyn.get().strip() or entry_imei_dyn.get().strip() in t)],
             "cached_register_values": cache_snapshot,
-            "wifi_device_ip": entry_wifi_ip.get().strip() if 'entry_wifi_ip' in locals() else saved_state.get("wifi_device_ip", "192.168.4.1"),
-            "wifi_device_port": int(entry_wifi_port.get().strip() or 80) if 'entry_wifi_port' in locals() else saved_state.get("wifi_device_port", 80),
-            "wifi_protocol": combo_wifi_proto.get().strip() if 'combo_wifi_proto' in locals() else saved_state.get("wifi_protocol", "HTTP POST (/ondemand)"),
-            "transport_mode": var_transport_mode.get() if 'var_transport_mode' in locals() else "mqtt"
+            "wifi_device_ip": (entry_wifi_ip.get().strip() if entry_wifi_ip is not None else None) or saved_state.get("wifi_device_ip", "192.168.4.1"),
+            "wifi_device_port": int((entry_wifi_port.get().strip() if entry_wifi_port is not None else None) or saved_state.get("wifi_device_port", 502)),
+            "wifi_protocol": (combo_wifi_proto.get().strip() if combo_wifi_proto is not None else None) or saved_state.get("wifi_protocol", "Modbus TCP/IP (Port 502 - Func 03 Holding Regs)"),
+            "transport_mode": var_transport_mode.get() if var_transport_mode is not None else "mqtt"
         }
         save_app_state(st)
 
@@ -3656,10 +4404,14 @@ def main_menu():
         print(f"  [7] Toggle Telemetry Display Mode (Currently: {curr_mode})")
         print("  [8] Open Excel / CSV RTEvent Log File")
         print("  [9] Offline Simulator Mode       (Test without connecting to live broker)")
-        print("  [10] Exit\n")
+        print("  [10] Launch PCB Modbus Dashboard (modbus_app.py)")
+        print("  [11] Launch Modbus Port Scanner   (port_scanner.py)")
+        print("  [12] Compare Register Snapshots   (registers_1.json vs registers_2.json)")
+        print("  [13] Load registers_1.json Snapshot into Cache (4001 registers)")
+        print("  [14] Exit\n")
         print("-" * 80)
 
-        choice = input("Enter your choice (1-10): ").strip()
+        choice = input("Enter your choice (1-14): ").strip()
 
         if choice == "1":
             launch_gui()
@@ -3698,7 +4450,51 @@ def main_menu():
             cfg = load_config_file("config.yaml") if os.path.exists("config.yaml") else DEFAULT_CONFIG
             run_simulator(cfg)
 
-        elif choice in ["10", "q", "exit"]:
+        elif choice == "10":
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Modbus reader", "modbus_app.py")
+            if os.path.exists(p):
+                subprocess.Popen([sys.executable, p], cwd=os.path.dirname(p))
+                print(f"[+] Launched PCB Modbus Dashboard: {p}")
+            else:
+                print(f"[!] File not found: {p}")
+
+        elif choice == "11":
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Modbus reader", "port_scanner.py")
+            if os.path.exists(p):
+                subprocess.Popen([sys.executable, p], cwd=os.path.dirname(p))
+                print(f"[+] Launched Modbus Port Scanner: {p}")
+            else:
+                print(f"[!] File not found: {p}")
+
+        elif choice == "12":
+            if _COMPARE_LIB_OK and _comp_reg:
+                _comp_reg.main()
+            else:
+                p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Modbus reader", "compare_registers.py")
+                if os.path.exists(p):
+                    os.system(f'"{sys.executable}" "{p}"')
+                else:
+                    print(f"[!] File not found: {p}")
+
+        elif choice == "13":
+            r1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registers_1.json")
+            if os.path.exists(r1):
+                with open(r1, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                vals = d.get("values", {})
+                st = load_app_state()
+                cache = st.get("cached_register_values", {})
+                now_str = d.get("timestamp", datetime.now().isoformat())
+                for k, v in vals.items():
+                    cache[str(k)] = {"value": str(v), "updated_at": now_str}
+                st["cached_register_values"] = cache
+                save_app_state(st)
+                print(f"[+] Loaded registers_1.json: {len(vals)} registers imported into app_state cache!")
+                print(f"    When you launch the GUI (Option 1), all register values will appear in the table.")
+            else:
+                print(f"[!] registers_1.json not found at {r1}")
+
+        elif choice in ["14", "q", "exit"]:
             print("\nExiting. Goodbye!")
             sys.exit(0)
 

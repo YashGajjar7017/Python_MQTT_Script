@@ -36,7 +36,7 @@ topics:
   # Subscriptions: Subscribes to ALL topics for THIS device via wildcard suffix #
   # This guarantees 100% of packets from the active device are received, exactly like in MQTTBox!
   info_subscriptions:
-    - "rtsg-1/ongridrooftop/{imei}/#"
+    - "rtsg-1/ongridrooftop/{imei}/+/+"
     - "rtsg-1/ongridrooftop/{imei}/ondemand/pub"
     - "rtsg-1/ongridrooftop/{imei}/data/pub"
     - "rtsg-1/ongridrooftop/{imei}/heartbeat/pub"

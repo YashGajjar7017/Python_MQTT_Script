@@ -29,7 +29,7 @@
     <rtevent_pub_template>rtsg-1/ongridrooftop/{imei}/rtevent/pub</rtevent_pub_template>
 
     <info_subscriptions>
-      <topic>rtsg-1/ongridrooftop/{imei}/#</topic>
+      <topic>rtsg-1/ongridrooftop/{imei}/+/+</topic>
       <topic>rtsg-1/ongridrooftop/{imei}/ondemand/pub</topic>
       <topic>rtsg-1/ongridrooftop/{imei}/data/pub</topic>
       <topic>rtsg-1/ongridrooftop/{imei}/heartbeat/pub</topic>
